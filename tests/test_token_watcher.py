@@ -211,6 +211,63 @@ class TokenWatcherTests(unittest.TestCase):
                 tracker.call_periods["cumulative"][("Codex", "gpt-test")], 2
             )
 
+    def test_codex_fork_rewritten_history_is_seeded_without_counting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            session_dir = home / ".codex" / "sessions" / "2026" / "07" / "14"
+            session_dir.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            baseline_time = now - timedelta(hours=1)
+            root_session = "root-session"
+            original = session_dir / "rollout-2026-07-14T00-00-00-original.jsonl"
+            forked = session_dir / "rollout-2026-07-14T01-00-00-forked.jsonl"
+            original.write_text(
+                self._codex_lines(
+                    root_session,
+                    10,
+                    now - timedelta(hours=2),
+                    cumulative=10,
+                ),
+                encoding="utf-8",
+            )
+            child_meta = json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "child-session",
+                        "forked_from_id": root_session,
+                    },
+                }
+            ) + "\n"
+            forked.write_text(
+                child_meta
+                + self._codex_lines(
+                    root_session,
+                    10,
+                    now,
+                    cumulative=10,
+                )
+                + self._codex_lines(
+                    root_session,
+                    20,
+                    now + timedelta(seconds=1),
+                    cumulative=30,
+                ),
+                encoding="utf-8",
+            )
+            watcher = FakeWatcher()
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                tracker = token_watcher.CodexTailTracker(
+                    baseline_time, watcher=watcher
+                )
+
+            self.assertEqual(
+                tracker.periods["cumulative"][("Codex", "gpt-test")], 20
+            )
+            self.assertEqual(
+                tracker.call_periods["cumulative"][("Codex", "gpt-test")], 1
+            )
+
     def test_claude_runtime_changes_do_not_rescan_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             home = Path(temporary_directory)

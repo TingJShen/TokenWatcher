@@ -427,18 +427,13 @@ class CodexTailTracker:
 
     def _paths(self) -> list[Path]:
         paths = []
-        threshold = self.since.timestamp() - 5
         for folder_name in ("sessions", "archived_sessions"):
             folder = self.root / folder_name
             if not folder.exists():
                 continue
             for path in folder.rglob("*.jsonl"):
-                try:
-                    if path.stat().st_mtime >= threshold:
-                        paths.append(path)
-                except OSError:
-                    continue
-        return paths
+                paths.append(path)
+        return sorted(paths, key=lambda path: path.name)
 
     def _discover_startup(self) -> None:
         for path in self._paths():
@@ -489,13 +484,6 @@ class CodexTailTracker:
             usage = info.get("last_token_usage")
             if not isinstance(usage, dict):
                 continue
-            try:
-                event_time = parse_time(event.get("timestamp")).astimezone(timezone.utc)
-            except (TypeError, ValueError):
-                self.errors += 1
-                continue
-            if event_time <= self.since:
-                continue
             total_tokens = int(usage.get("total_tokens") or 0)
             if not total_tokens:
                 total_tokens = int(usage.get("input_tokens") or 0) + int(
@@ -512,6 +500,13 @@ class CodexTailTracker:
             if fingerprint in self.seen:
                 continue
             self.seen.add(fingerprint)
+            try:
+                event_time = parse_time(event.get("timestamp")).astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                self.errors += 1
+                continue
+            if event_time <= self.since:
+                continue
             key = ("Codex", model)
             add_period_usage(
                 self.periods,
