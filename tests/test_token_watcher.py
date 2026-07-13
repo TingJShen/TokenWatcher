@@ -268,6 +268,88 @@ class TokenWatcherTests(unittest.TestCase):
                 tracker.call_periods["cumulative"][("Codex", "gpt-test")], 1
             )
 
+    def test_codex_cache_skips_unchanged_jsonl_files_on_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            session_dir = home / ".codex" / "sessions" / "2026" / "07" / "14"
+            session_dir.mkdir(parents=True)
+            cache_path = home / ".tokenwatcher" / "codex_fingerprint_cache.json"
+            now = datetime.now(timezone.utc)
+            log_path = session_dir / "rollout-2026-07-14T00-00-00-cache.jsonl"
+            log_path.write_text(
+                self._codex_lines("cache-session", 10, now, cumulative=10),
+                encoding="utf-8",
+            )
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                first = token_watcher.CodexTailTracker(
+                    now - timedelta(days=1),
+                    watcher=FakeWatcher(),
+                    cache_path=cache_path,
+                )
+            first.close()
+            self.assertTrue(cache_path.exists())
+
+            original_open = token_watcher.Path.open
+
+            def guarded_open(path: Path, *args, **kwargs):
+                if path.suffix.lower() == ".jsonl":
+                    raise AssertionError(f"unexpected JSONL read: {path}")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(token_watcher.Path, "home", return_value=home), patch.object(
+                token_watcher.Path, "open", guarded_open
+            ):
+                second = token_watcher.CodexTailTracker(
+                    now,
+                    watcher=FakeWatcher(),
+                    cache_path=cache_path,
+                )
+            self.assertEqual(second.states[log_path].offset, log_path.stat().st_size)
+            second.close()
+
+    def test_codex_cache_tails_only_bytes_appended_after_cached_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            session_dir = home / ".codex" / "sessions" / "2026" / "07" / "14"
+            session_dir.mkdir(parents=True)
+            cache_path = home / ".tokenwatcher" / "codex_fingerprint_cache.json"
+            now = datetime.now(timezone.utc)
+            log_path = session_dir / "rollout-2026-07-14T00-00-00-tail.jsonl"
+            log_path.write_text(
+                self._codex_lines("tail-session", 10, now, cumulative=10),
+                encoding="utf-8",
+            )
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                first = token_watcher.CodexTailTracker(
+                    now - timedelta(days=1),
+                    watcher=FakeWatcher(),
+                    cache_path=cache_path,
+                )
+            first.close()
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    self._codex_lines(
+                        "tail-session",
+                        20,
+                        now + timedelta(seconds=1),
+                        cumulative=30,
+                    )
+                )
+
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                second = token_watcher.CodexTailTracker(
+                    now,
+                    watcher=FakeWatcher(),
+                    cache_path=cache_path,
+                )
+            self.assertEqual(
+                second.periods["cumulative"][("Codex", "gpt-test")], 20
+            )
+            self.assertEqual(
+                second.call_periods["cumulative"][("Codex", "gpt-test")], 1
+            )
+            second.close()
+
     def test_claude_runtime_changes_do_not_rescan_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             home = Path(temporary_directory)

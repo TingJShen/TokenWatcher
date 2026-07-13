@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import hashlib
 import json
 import os
 import queue
@@ -53,6 +55,7 @@ CODEX_USAGE_KEYS = (
     "reasoning_output_tokens",
     "total_tokens",
 )
+CODEX_CACHE_VERSION = 1
 
 
 def codex_usage_fingerprint(
@@ -72,6 +75,15 @@ def codex_usage_fingerprint(
         str(event_timestamp or ""),
         *last_values,
     )
+
+
+def codex_fingerprint_digest(fingerprint: tuple) -> str:
+    payload = json.dumps(
+        fingerprint,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()
 
 
 class DirectoryChangeWatcher:
@@ -412,18 +424,140 @@ class CodexTailTracker:
         self,
         since: datetime,
         watcher: DirectoryChangeWatcher | None = None,
+        cache_path: Path | None = None,
     ):
         self.since = since.astimezone(timezone.utc)
         self.root = Path.home() / ".codex"
+        self.cache_path = cache_path or (
+            Path.home() / ".tokenwatcher" / "codex_fingerprint_cache.json"
+        )
         self._owns_watcher = watcher is None
         self.watcher = watcher or DirectoryChangeWatcher(self.root)
         self.states: dict[Path, CodexFileState] = {}
         self.periods = empty_periods()
         self.call_periods = empty_periods()
-        self.seen: set[tuple] = set()
+        self.seen: set[str] = set()
+        self.cached_files: dict[str, dict] = {}
+        self.cache_dirty = False
         self.last_event: datetime | None = None
         self.errors = 0
+        self.cache_errors = 0
+        self._load_cache()
         self._discover_startup()
+
+    @staticmethod
+    def _cache_key(path: Path) -> str:
+        return path.name
+
+    def _load_cache(self) -> None:
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            if int(payload.get("version") or 0) != CODEX_CACHE_VERSION:
+                return
+            fingerprints = payload.get("fingerprints") or []
+            files = payload.get("files") or {}
+            if not isinstance(fingerprints, list) or not isinstance(files, dict):
+                return
+            self.seen = {
+                value
+                for value in fingerprints
+                if isinstance(value, str) and len(value) == 32
+            }
+            self.cached_files = {
+                str(key): value
+                for key, value in files.items()
+                if isinstance(value, dict)
+            }
+        except FileNotFoundError:
+            return
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            self.cache_errors += 1
+
+    def _save_cache(self) -> None:
+        if not self.cache_dirty:
+            return
+        payload = {
+            "version": CODEX_CACHE_VERSION,
+            "updated_at": datetime.now(SHANGHAI).isoformat(),
+            "fingerprints": sorted(self.seen),
+            "files": self.cached_files,
+        }
+        temporary_path = self.cache_path.with_suffix(".tmp")
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(temporary_path, self.cache_path)
+            self.cache_dirty = False
+        except OSError:
+            self.cache_errors += 1
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _state_from_cache(
+        self,
+        path: Path,
+        stat: os.stat_result,
+        startup_cold: bool,
+    ) -> tuple[CodexFileState, bool]:
+        record = self.cached_files.get(self._cache_key(path)) or {}
+        cached_size = int(record.get("size") or 0)
+        cached_mtime_ns = int(record.get("mtime_ns") or 0)
+        cached_offset = int(record.get("offset") or 0)
+        exact = (
+            cached_size == stat.st_size
+            and cached_mtime_ns == stat.st_mtime_ns
+            and cached_offset == stat.st_size
+            and bool(record)
+        )
+        offset = cached_offset
+        if offset < 0 or offset > stat.st_size:
+            offset = 0
+        if not exact and stat.st_size == cached_size:
+            offset = 0
+        remainder = b""
+        encoded_remainder = record.get("remainder")
+        if offset and isinstance(encoded_remainder, str):
+            try:
+                remainder = base64.b64decode(encoded_remainder.encode("ascii"))
+            except (ValueError, UnicodeEncodeError):
+                remainder = b""
+        state = CodexFileState(
+            offset=offset,
+            remainder=remainder,
+            model=str(record.get("model") or "<unknown>"),
+            session_id=str(record.get("session_id") or ""),
+            last_mtime=stat.st_mtime,
+            last_size=stat.st_size if exact else offset,
+            watching=not startup_cold,
+            stop_after_initial=startup_cold,
+        )
+        return state, exact
+
+    def _remember_file(
+        self,
+        path: Path,
+        state: CodexFileState,
+        stat: os.stat_result,
+    ) -> None:
+        record = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "offset": state.offset,
+            "session_id": state.session_id,
+            "model": state.model,
+            "remainder": base64.b64encode(state.remainder).decode("ascii")
+            if state.remainder
+            else "",
+        }
+        key = self._cache_key(path)
+        if self.cached_files.get(key) != record:
+            self.cached_files[key] = record
+            self.cache_dirty = True
 
     def _paths(self) -> list[Path]:
         paths = []
@@ -438,14 +572,22 @@ class CodexTailTracker:
     def _discover_startup(self) -> None:
         for path in self._paths():
             try:
-                startup_cold = (
-                    path.stat().st_mtime < time.time() - STARTUP_HOT_SECONDS
-                )
+                stat = path.stat()
             except OSError:
-                startup_cold = False
-            state = CodexFileState(stop_after_initial=startup_cold)
+                self.errors += 1
+                continue
+            startup_cold = stat.st_mtime < time.time() - STARTUP_HOT_SECONDS
+            state, exact_cache_hit = self._state_from_cache(
+                path,
+                stat,
+                startup_cold,
+            )
             self.states[path] = state
+            if exact_cache_hit:
+                state.next_check = time.monotonic() + REFRESH_SECONDS
+                continue
             self._read_path(path, state, initial=True)
+        self._save_cache()
 
     def _discover_changes(self) -> None:
         for path in self.watcher.drain():
@@ -453,7 +595,15 @@ class CodexTailTracker:
                 continue
             state = self.states.get(path)
             if state is None:
-                state = CodexFileState()
+                try:
+                    stat = path.stat()
+                    state, _exact_cache_hit = self._state_from_cache(
+                        path,
+                        stat,
+                        startup_cold=False,
+                    )
+                except OSError:
+                    state = CodexFileState()
                 self.states[path] = state
             state.watching = True
             state.stop_after_initial = False
@@ -492,14 +642,17 @@ class CodexTailTracker:
             if total_tokens <= 0:
                 continue
             model = state.model or "<unknown>"
-            fingerprint = codex_usage_fingerprint(
-                state.session_id,
-                event.get("timestamp"),
-                info,
+            fingerprint = codex_fingerprint_digest(
+                codex_usage_fingerprint(
+                    state.session_id,
+                    event.get("timestamp"),
+                    info,
+                )
             )
             if fingerprint in self.seen:
                 continue
             self.seen.add(fingerprint)
+            self.cache_dirty = True
             try:
                 event_time = parse_time(event.get("timestamp")).astimezone(timezone.utc)
             except (TypeError, ValueError):
@@ -541,12 +694,15 @@ class CodexTailTracker:
             if size < state.offset:
                 state.offset = 0
                 state.remainder = b""
+                state.model = "<unknown>"
+                state.session_id = ""
             state.last_size = size
             state.last_mtime = mtime
             if size == state.offset:
                 if initial and state.stop_after_initial:
                     state.watching = False
                 state.next_check = now + REFRESH_SECONDS
+                self._remember_file(path, state, stat)
                 return
             with path.open("rb") as handle:
                 handle.seek(state.offset)
@@ -554,6 +710,7 @@ class CodexTailTracker:
             state.offset = size
             state.next_check = now + REFRESH_SECONDS
             self._consume(data, state, initial)
+            self._remember_file(path, state, stat)
             if initial and state.stop_after_initial:
                 state.watching = False
         except FileNotFoundError:
@@ -571,6 +728,7 @@ class CodexTailTracker:
             self._read_path(path, state, now=now)
 
     def close(self) -> None:
+        self._save_cache()
         if self._owns_watcher:
             self.watcher.close()
 

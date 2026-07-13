@@ -11,6 +11,8 @@
 
 The overlay updates every 0.5 seconds. At startup, the data engine checks the available Codex, Claude Code, and Cline history once. During runtime it uses native Windows directory-change notifications to discover created or modified logs, tails changed files from their previous byte offsets, and keeps only recently active files in the polling fallback. Older cold files are not periodically enumerated or checked. Codex token events are deduplicated by their cumulative usage snapshot, so copied history from continued or forked tasks is not added again. Claude/Cline summary JSON is only reparsed when its file metadata changes. When a model's token count or request count increases, the previous value rolls upward and the new value briefly appears in green. The corresponding model name also flashes green when its token total increases.
 
+TokenWatcher persists Codex fingerprints, per-file offsets, session lineage, and parser state in `~/.tokenwatcher/codex_fingerprint_cache.json`. On later starts, unchanged JSONL files are verified by size and modification time but are not opened. New or appended files are read only from the cached byte offset. If the cache is missing, invalid, or from an incompatible version, it is rebuilt automatically from local history.
+
 ## Data lookup order
 
 An optional generated baseline report is resolved in this order:
