@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -18,7 +19,6 @@ APP_TITLE = "TokenWatcher"
 INSTANCE_MUTEX_NAME = "Local\\TokenWatcher.Singleton"
 START_DATE = date(2026, 2, 1)
 REFRESH_SECONDS = 0.5
-DISCOVERY_SECONDS = 10.0
 STARTUP_HOT_SECONDS = 300.0
 SHANGHAI = timezone(timedelta(hours=8))
 PERIODS = ("today", "week", "month", "cumulative")
@@ -46,6 +46,151 @@ CLINE_HISTORY = (
     / "taskHistory.json"
 )
 CLINE_TASKS = CLINE_HISTORY.parent.parent / "tasks"
+
+
+class DirectoryChangeWatcher:
+    """Collect recursive Windows directory changes without rescanning the tree."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.available = False
+        self._changes: queue.SimpleQueue[Path] = queue.SimpleQueue()
+        self._closed = threading.Event()
+        self._kernel32 = None
+        self._handle = None
+        self._thread: threading.Thread | None = None
+        if os.name == "nt" and root.exists():
+            self._start_windows()
+
+    def _start_windows(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        file_list_directory = 0x0001
+        share_all = 0x00000001 | 0x00000002 | 0x00000004
+        open_existing = 3
+        backup_semantics = 0x02000000
+        invalid_handle = ctypes.c_void_p(-1).value
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        handle = kernel32.CreateFileW(
+            str(self.root),
+            file_list_directory,
+            share_all,
+            None,
+            open_existing,
+            backup_semantics,
+            None,
+        )
+        if handle == invalid_handle:
+            return
+        self._kernel32 = kernel32
+        self._handle = handle
+        self.available = True
+        self._thread = threading.Thread(
+            target=self._run_windows,
+            daemon=True,
+            name=f"watch-{self.root.name}",
+        )
+        self._thread.start()
+
+    def _run_windows(self) -> None:
+        import ctypes
+        import struct
+        from ctypes import wintypes
+
+        notify_filter = (
+            0x00000001  # FILE_NOTIFY_CHANGE_FILE_NAME
+            | 0x00000002  # FILE_NOTIFY_CHANGE_DIR_NAME
+            | 0x00000008  # FILE_NOTIFY_CHANGE_SIZE
+            | 0x00000010  # FILE_NOTIFY_CHANGE_LAST_WRITE
+            | 0x00000040  # FILE_NOTIFY_CHANGE_CREATION
+        )
+        kernel32 = self._kernel32
+        if kernel32 is None:
+            self.available = False
+            return
+        kernel32.ReadDirectoryChangesW.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            wintypes.LPDWORD,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+        )
+        kernel32.ReadDirectoryChangesW.restype = wintypes.BOOL
+        buffer = ctypes.create_string_buffer(64 * 1024)
+        bytes_returned = wintypes.DWORD()
+        while not self._closed.is_set() and self._handle is not None:
+            ok = kernel32.ReadDirectoryChangesW(
+                self._handle,
+                buffer,
+                len(buffer),
+                True,
+                notify_filter,
+                ctypes.byref(bytes_returned),
+                None,
+                None,
+            )
+            if not ok:
+                break
+            length = int(bytes_returned.value)
+            if not length:
+                continue
+            offset = 0
+            while offset < length:
+                next_offset, _action, name_bytes = struct.unpack_from(
+                    "<III", buffer.raw, offset
+                )
+                name_start = offset + 12
+                relative_name = buffer.raw[
+                    name_start : name_start + name_bytes
+                ].decode("utf-16-le", errors="replace")
+                self._changes.put(self.root / relative_name)
+                if not next_offset:
+                    break
+                offset += next_offset
+        self.available = False
+
+    def drain(self) -> set[Path]:
+        changes: set[Path] = set()
+        while True:
+            try:
+                changes.add(self._changes.get_nowait())
+            except queue.Empty:
+                return changes
+
+    def close(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        handle = self._handle
+        self._handle = None
+        self.available = False
+        if handle is not None and os.name == "nt":
+            from ctypes import wintypes
+
+            kernel32 = self._kernel32
+            if kernel32 is not None:
+                kernel32.CancelIoEx.argtypes = (wintypes.HANDLE, wintypes.LPVOID)
+                kernel32.CancelIoEx.restype = wintypes.BOOL
+                kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+                kernel32.CloseHandle.restype = wintypes.BOOL
+                kernel32.CancelIoEx(handle, None)
+                kernel32.CloseHandle(handle)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.2)
 
 
 def enable_dpi_awareness() -> None:
@@ -237,17 +382,22 @@ class CodexFileState:
 
 
 class CodexTailTracker:
-    def __init__(self, since: datetime):
+    def __init__(
+        self,
+        since: datetime,
+        watcher: DirectoryChangeWatcher | None = None,
+    ):
         self.since = since.astimezone(timezone.utc)
         self.root = Path.home() / ".codex"
+        self._owns_watcher = watcher is None
+        self.watcher = watcher or DirectoryChangeWatcher(self.root)
         self.states: dict[Path, CodexFileState] = {}
         self.periods = empty_periods()
         self.call_periods = empty_periods()
         self.seen: set[tuple] = set()
         self.last_event: datetime | None = None
-        self.last_discovery = 0.0
         self.errors = 0
-        self._discover(force=True)
+        self._discover_startup()
 
     def _paths(self) -> list[Path]:
         paths = []
@@ -264,21 +414,29 @@ class CodexTailTracker:
                     continue
         return paths
 
-    def _discover(self, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now - self.last_discovery < DISCOVERY_SECONDS:
-            return
-        self.last_discovery = now
+    def _discover_startup(self) -> None:
         for path in self._paths():
-            if path in self.states:
-                continue
             try:
-                startup_cold = force and path.stat().st_mtime < time.time() - STARTUP_HOT_SECONDS
+                startup_cold = (
+                    path.stat().st_mtime < time.time() - STARTUP_HOT_SECONDS
+                )
             except OSError:
                 startup_cold = False
             state = CodexFileState(stop_after_initial=startup_cold)
             self.states[path] = state
             self._read_path(path, state, initial=True)
+
+    def _discover_changes(self) -> None:
+        for path in self.watcher.drain():
+            if path.suffix.lower() != ".jsonl":
+                continue
+            state = self.states.get(path)
+            if state is None:
+                state = CodexFileState()
+                self.states[path] = state
+            state.watching = True
+            state.stop_after_initial = False
+            state.next_check = 0.0
 
     def _consume(self, data: bytes, state: CodexFileState, initial: bool) -> None:
         data = state.remainder + data
@@ -362,14 +520,12 @@ class CodexTailTracker:
             if size < state.offset:
                 state.offset = 0
                 state.remainder = b""
-            changed = size != state.last_size or mtime != state.last_mtime
             state.last_size = size
             state.last_mtime = mtime
             if size == state.offset:
-                if initial:
+                if initial and state.stop_after_initial:
                     state.watching = False
-                else:
-                    state.next_check = now + REFRESH_SECONDS
+                state.next_check = now + REFRESH_SECONDS
                 return
             with path.open("rb") as handle:
                 handle.seek(state.offset)
@@ -379,16 +535,23 @@ class CodexTailTracker:
             self._consume(data, state, initial)
             if initial and state.stop_after_initial:
                 state.watching = False
-            if not changed:
+        except FileNotFoundError:
+            if state.offset:
                 state.watching = False
+            else:
+                state.next_check = now + REFRESH_SECONDS
         except OSError:
             self.errors += 1
 
     def poll(self) -> None:
-        self._discover()
+        self._discover_changes()
         now = time.monotonic()
         for path, state in list(self.states.items()):
             self._read_path(path, state, now=now)
+
+    def close(self) -> None:
+        if self._owns_watcher:
+            self.watcher.close()
 
 
 def _parse_claude_usage(stats_path: Path) -> tuple[dict[str, Counter], str, datetime]:
@@ -461,24 +624,26 @@ class ClaudeFileState:
 
 
 class ClaudeTailTracker:
-    def __init__(self, since: datetime, track_tokens: bool = True):
+    def __init__(
+        self,
+        since: datetime,
+        track_tokens: bool = True,
+        watcher: DirectoryChangeWatcher | None = None,
+    ):
         self.since = since.astimezone(timezone.utc)
         self.track_tokens = track_tokens
         self.root = Path.home() / ".claude" / "projects"
+        self._owns_watcher = watcher is None
+        self.watcher = watcher or DirectoryChangeWatcher(self.root)
         self.states: dict[Path, ClaudeFileState] = {}
         self.periods = empty_periods()
         self.call_periods = empty_periods()
         self.seen: set[tuple] = set()
         self.last_event: datetime | None = None
-        self.last_discovery = 0.0
         self.errors = 0
-        self._discover(force=True)
+        self._discover_startup()
 
-    def _discover(self, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now - self.last_discovery < DISCOVERY_SECONDS:
-            return
-        self.last_discovery = now
+    def _discover_startup(self) -> None:
         if not self.root.exists():
             return
         threshold = self.since.timestamp() - 5
@@ -489,10 +654,22 @@ class ClaudeTailTracker:
                     continue
             except OSError:
                 continue
-            startup_cold = force and stat.st_mtime < time.time() - STARTUP_HOT_SECONDS
+            startup_cold = stat.st_mtime < time.time() - STARTUP_HOT_SECONDS
             state = ClaudeFileState(stop_after_initial=startup_cold)
             self.states[path] = state
             self._read_path(path, state, initial=True)
+
+    def _discover_changes(self) -> None:
+        for path in self.watcher.drain():
+            if path.suffix.lower() != ".jsonl":
+                continue
+            state = self.states.get(path)
+            if state is None:
+                state = ClaudeFileState()
+                self.states[path] = state
+            state.watching = True
+            state.stop_after_initial = False
+            state.next_check = 0.0
 
     def _consume(self, data: bytes, state: ClaudeFileState) -> None:
         data = state.remainder + data
@@ -557,14 +734,12 @@ class ClaudeTailTracker:
             if size < state.offset:
                 state.offset = 0
                 state.remainder = b""
-            changed = size != state.last_size or mtime != state.last_mtime
             state.last_size = size
             state.last_mtime = mtime
             if size == state.offset:
-                if initial:
+                if initial and state.stop_after_initial:
                     state.watching = False
-                else:
-                    state.next_check = now + REFRESH_SECONDS
+                state.next_check = now + REFRESH_SECONDS
                 return
             with path.open("rb") as handle:
                 handle.seek(state.offset)
@@ -574,16 +749,23 @@ class ClaudeTailTracker:
             self._consume(data, state)
             if initial and state.stop_after_initial:
                 state.watching = False
-            if not changed:
+        except FileNotFoundError:
+            if state.offset:
                 state.watching = False
+            else:
+                state.next_check = now + REFRESH_SECONDS
         except OSError:
             self.errors += 1
 
     def poll(self) -> None:
-        self._discover()
+        self._discover_changes()
         now = time.monotonic()
         for path, state in list(self.states.items()):
             self._read_path(path, state, now=now)
+
+    def close(self) -> None:
+        if self._owns_watcher:
+            self.watcher.close()
 
 
 def load_cline_tasks() -> dict[str, tuple[str, int, datetime]]:
@@ -621,9 +803,17 @@ class ClineTaskCache:
 
 
 class ClineRequestCounter:
-    def __init__(self, since: datetime):
+    def __init__(
+        self,
+        since: datetime,
+        watcher: DirectoryChangeWatcher | None = None,
+    ):
         self.since = since.astimezone(SHANGHAI)
-        self.states: dict[Path, tuple[float, dict[str, Counter]]] = {}
+        self._owns_watcher = watcher is None
+        self.watcher = watcher or DirectoryChangeWatcher(CLINE_HISTORY.parent.parent)
+        self.states: dict[Path, tuple[tuple[float, int], dict[str, Counter]]] = {}
+        self.known_paths: set[Path] = set()
+        self.initialized = False
         self.periods = empty_periods()
 
     def _parse_path(self, path: Path, fallback_model: str) -> dict[str, Counter]:
@@ -651,29 +841,60 @@ class ClineRequestCounter:
             add_period_usage(periods, ("Cline", model), 1, event_date.date())
         return periods
 
+    def _refresh_path(self, path: Path, fallback_model: str) -> None:
+        try:
+            stat = path.stat()
+        except OSError:
+            self.states.pop(path, None)
+            return
+        if stat.st_mtime <= self.since.timestamp():
+            return
+        signature = (stat.st_mtime, stat.st_size)
+        previous = self.states.get(path)
+        if previous is None or previous[0] != signature:
+            self.states[path] = (signature, self._parse_path(path, fallback_model))
+
     def poll(self, tasks: dict[str, tuple[str, int, datetime]]) -> None:
-        active_paths = set()
-        for task_id, (model, _total, _timestamp) in tasks.items():
+        models_by_path: dict[Path, str] = {}
+        timestamps_by_path: dict[Path, datetime] = {}
+        for task_id, (model, _total, timestamp) in tasks.items():
             path = CLINE_TASKS / task_id / "ui_messages.json"
-            if not path.exists():
-                continue
-            active_paths.add(path)
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                continue
-            if mtime <= self.since.timestamp():
-                continue
-            previous = self.states.get(path)
-            if previous is None or previous[0] != mtime:
-                self.states[path] = (mtime, self._parse_path(path, model))
+            models_by_path[path] = model
+            timestamps_by_path[path] = timestamp
+        active_paths = set(models_by_path)
+        if not self.initialized:
+            candidates = set(active_paths)
+            self.initialized = True
+        else:
+            candidates = {
+                path
+                for path in self.watcher.drain()
+                if path.name.lower() == "ui_messages.json" and path in active_paths
+            }
+            candidates.update(active_paths - self.known_paths)
+            if not self.watcher.available:
+                hot_boundary = datetime.now(SHANGHAI) - timedelta(
+                    seconds=STARTUP_HOT_SECONDS
+                )
+                candidates.update(
+                    path
+                    for path, timestamp in timestamps_by_path.items()
+                    if timestamp >= hot_boundary
+                )
+        for path in candidates:
+            self._refresh_path(path, models_by_path[path])
         for path in set(self.states) - active_paths:
             del self.states[path]
+        self.known_paths = active_paths
         combined = empty_periods()
-        for _mtime, path_periods in self.states.values():
+        for _signature, path_periods in self.states.values():
             for period in PERIODS:
                 combined[period].update(path_periods[period])
         self.periods = combined
+
+    def close(self) -> None:
+        if self._owns_watcher:
+            self.watcher.close()
 
 
 class ClinePoller:
@@ -757,6 +978,10 @@ class ClinePoller:
         self.status = f"Cline 任务：{len(current_tasks)}"
 
 
+    def close(self) -> None:
+        self.request_counter.close()
+
+
 @dataclass(frozen=True)
 class UsageSnapshot:
     periods: dict[str, dict[tuple[str, str], int]]
@@ -789,8 +1014,20 @@ class UsageEngine:
         self.claude_boundary: datetime | None = None
         self.cline: ClinePoller | None = None
 
+    def _close_trackers(self) -> None:
+        if self.codex is not None:
+            self.codex.close()
+        if self.claude is not None:
+            self.claude.close()
+        if self.claude_calls is not None:
+            self.claude_calls.close()
+        if self.cline is not None:
+            self.cline.close()
+
     def _reload(self) -> None:
-        self.baseline = load_baseline(self.report_dir)
+        baseline = load_baseline(self.report_dir)
+        self._close_trackers()
+        self.baseline = baseline
         self.codex = CodexTailTracker(self.baseline.refreshed_at)
         self.claude = None
         self.claude_calls = ClaudeTailTracker(
@@ -815,6 +1052,8 @@ class UsageEngine:
             self.cline.poll()
             claude_periods, claude_status, claude_boundary = self.claude_usage.read()
             if self.claude is None or self.claude_boundary != claude_boundary:
+                if self.claude is not None:
+                    self.claude.close()
                 self.claude = ClaudeTailTracker(claude_boundary)
                 self.claude_boundary = claude_boundary
             self.claude.poll()
@@ -893,6 +1132,7 @@ class UsageEngine:
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=1.5)
+        self._close_trackers()
 
     def get_snapshot(self) -> UsageSnapshot | None:
         with self.lock:

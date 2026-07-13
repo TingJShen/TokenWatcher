@@ -9,7 +9,7 @@
 
 ## Refresh behavior
 
-The overlay updates every 0.5 seconds. The data engine tails changed Codex and Claude Code log files from their previous byte offsets, keeps startup files modified in the last 5 minutes and newly discovered files hot, checks older cold files only during startup, and only reparses Claude/Cline summary JSON when file metadata changes. When a model's token count or request count increases, the previous value rolls upward and the new value briefly appears in green. The corresponding model name also flashes green when its token total increases.
+The overlay updates every 0.5 seconds. At startup, the data engine checks the available Codex, Claude Code, and Cline history once. During runtime it uses native Windows directory-change notifications to discover created or modified logs, tails changed files from their previous byte offsets, and keeps only recently active files in the polling fallback. Older cold files are not periodically enumerated or checked. Claude/Cline summary JSON is only reparsed when its file metadata changes. When a model's token count or request count increases, the previous value rolls upward and the new value briefly appears in green. The corresponding model name also flashes green when its token total increases.
 
 ## Data lookup order
 
