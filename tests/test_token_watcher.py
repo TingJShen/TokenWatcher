@@ -155,6 +155,32 @@ class TokenWatcherTests(unittest.TestCase):
                 4,
             )
 
+    def test_report_preview_is_available_when_snapshot_cache_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "summary.json").write_text(
+                json.dumps(
+                    {"refreshed_at_shanghai": "2026-07-14T02:00:00+08:00"}
+                ),
+                encoding="utf-8",
+            )
+            (root / "model_total.csv").write_text(
+                "platform,model,total_tokens\nCodex,gpt-preview,456\n",
+                encoding="utf-8",
+            )
+            engine = token_watcher.UsageEngine(
+                report_dir=root,
+                snapshot_cache_path=root / "missing-cache.json",
+            )
+            preview = engine.get_snapshot()
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            self.assertEqual(
+                preview.periods["cumulative"][("Codex", "gpt-preview")],
+                456,
+            )
+            self.assertIn("Baseline report preview", preview.source_status[0])
+
     def test_usage_snapshot_cache_does_not_rewrite_unchanged_data(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -436,11 +462,15 @@ class TokenWatcherTests(unittest.TestCase):
                 token_watcher.Path, "open", guarded_open
             ):
                 second = token_watcher.CodexTailTracker(
-                    now,
+                    now - timedelta(days=1),
                     watcher=FakeWatcher(),
                     cache_path=cache_path,
                 )
             self.assertEqual(second.states[log_path].offset, log_path.stat().st_size)
+            self.assertEqual(
+                second.periods["cumulative"][("Codex", "gpt-test")],
+                10,
+            )
             second.close()
 
     def test_codex_cache_tails_only_bytes_appended_after_cached_offset(self) -> None:
@@ -474,16 +504,55 @@ class TokenWatcherTests(unittest.TestCase):
 
             with patch.object(token_watcher.Path, "home", return_value=home):
                 second = token_watcher.CodexTailTracker(
-                    now,
+                    now - timedelta(days=1),
                     watcher=FakeWatcher(),
                     cache_path=cache_path,
                 )
             self.assertEqual(
-                second.periods["cumulative"][("Codex", "gpt-test")], 20
+                second.periods["cumulative"][("Codex", "gpt-test")], 30
             )
             self.assertEqual(
-                second.call_periods["cumulative"][("Codex", "gpt-test")], 1
+                second.call_periods["cumulative"][("Codex", "gpt-test")], 2
             )
+            second.close()
+
+    def test_codex_cache_reuses_offsets_but_clears_delta_after_report_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            session_dir = home / ".codex" / "sessions" / "2026" / "07" / "14"
+            session_dir.mkdir(parents=True)
+            cache_path = home / ".tokenwatcher" / "codex_fingerprint_cache.json"
+            now = datetime.now(timezone.utc)
+            log_path = session_dir / "session.jsonl"
+            log_path.write_text(
+                self._codex_lines("boundary-session", 10, now, cumulative=10),
+                encoding="utf-8",
+            )
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                first = token_watcher.CodexTailTracker(
+                    now - timedelta(days=1),
+                    watcher=FakeWatcher(),
+                    cache_path=cache_path,
+                )
+            first.close()
+
+            original_open = token_watcher.Path.open
+
+            def guarded_open(path: Path, *args, **kwargs):
+                if path.suffix.lower() == ".jsonl":
+                    raise AssertionError(f"unexpected Codex JSONL read: {path}")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(token_watcher.Path, "home", return_value=home), patch.object(
+                token_watcher.Path, "open", guarded_open
+            ):
+                second = token_watcher.CodexTailTracker(
+                    now + timedelta(seconds=1),
+                    watcher=FakeWatcher(),
+                    cache_path=cache_path,
+                )
+            self.assertFalse(second.periods["cumulative"])
+            self.assertEqual(second.states[log_path].offset, log_path.stat().st_size)
             second.close()
 
     def test_claude_runtime_changes_do_not_rescan_tree(self) -> None:
@@ -520,6 +589,77 @@ class TokenWatcherTests(unittest.TestCase):
                 tracker.periods["cumulative"][("Claude Code", "claude-test")],
                 21,
             )
+
+    def test_claude_cache_skips_unchanged_jsonl_files_on_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            project_dir = home / ".claude" / "projects" / "project"
+            project_dir.mkdir(parents=True)
+            cache_path = home / ".tokenwatcher" / "claude_tail_cache.json"
+            now = datetime.now(timezone.utc)
+            log_path = project_dir / "session.jsonl"
+            log_path.write_text(
+                self._claude_line("cached", 9, now),
+                encoding="utf-8",
+            )
+            watcher = FakeWatcher()
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                first = token_watcher.ClaudeTailTracker(
+                    now - timedelta(days=1),
+                    watcher=watcher,
+                    cache_path=cache_path,
+                )
+            first.close()
+            self.assertTrue(cache_path.exists())
+
+            original_open = token_watcher.Path.open
+
+            def guarded_open(path: Path, *args, **kwargs):
+                if path.suffix.lower() == ".jsonl":
+                    raise AssertionError(f"unexpected Claude JSONL read: {path}")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(token_watcher.Path, "home", return_value=home), patch.object(
+                token_watcher.Path, "open", guarded_open
+            ):
+                second = token_watcher.ClaudeTailTracker(
+                    now - timedelta(days=1),
+                    watcher=FakeWatcher(),
+                    cache_path=cache_path,
+                )
+            self.assertEqual(
+                second.periods["cumulative"][("Claude Code", "claude-test")],
+                9,
+            )
+            self.assertEqual(
+                second.call_periods["cumulative"][("Claude Code", "claude-test")],
+                1,
+            )
+            second.close()
+
+    def test_claude_single_pass_uses_separate_token_and_call_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            project_dir = home / ".claude" / "projects" / "project"
+            project_dir.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            log_path = project_dir / "session.jsonl"
+            log_path.write_text(
+                self._claude_line("old-token", 5, now - timedelta(hours=2))
+                + self._claude_line("new-token", 7, now),
+                encoding="utf-8",
+            )
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                tracker = token_watcher.ClaudeTailTracker(
+                    since=now - timedelta(hours=1),
+                    call_since=now - timedelta(hours=3),
+                    watcher=FakeWatcher(),
+                    cache_path=home / "claude.json",
+                )
+            key = ("Claude Code", "claude-test")
+            self.assertEqual(tracker.periods["cumulative"][key], 7)
+            self.assertEqual(tracker.call_periods["cumulative"][key], 2)
+            tracker.close()
 
     def test_cline_only_stats_changed_task_files_after_startup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

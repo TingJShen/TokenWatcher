@@ -32,6 +32,7 @@ try {
         --clean `
         --onedir `
         --windowed `
+        --exclude-module numpy `
         --name TokenWatcher `
         --distpath (Join-Path $Root 'dist') `
         --workpath (Join-Path $Root 'build\TokenWatcher') `

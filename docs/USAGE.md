@@ -13,7 +13,11 @@ The overlay updates every 0.5 seconds. At startup, the data engine checks the av
 
 TokenWatcher persists Codex fingerprints, per-file offsets, session lineage, and parser state in `~/.tokenwatcher/codex_fingerprint_cache.json`. On later starts, unchanged JSONL files are verified by size and modification time but are not opened. New or appended files are read only from the cached byte offset. If the cache is missing, invalid, or from an incompatible version, it is rebuilt automatically from local history.
 
+Claude token deltas and request counts share one parser pass. Its offsets, fingerprints, and aggregate deltas are persisted in `~/.tokenwatcher/claude_tail_cache.json`, so unchanged project logs are metadata-checked but not reopened on normal restarts.
+
 The last verified aggregate values are stored separately in `~/.tokenwatcher/usage_snapshot_cache.json`. This small file is tied to the resolved baseline-report directory and loaded before the overlay is shown, so token totals appear immediately while the incremental trackers reconcile newer events in the background. It is written after the first completed background refresh and on a clean exit only when totals changed; the 0.5-second UI loop does not write it.
+
+The overlay remains hidden until cached totals have been painted. If the snapshot cache is missing or invalid, TokenWatcher uses the small baseline report as an immediate preview instead of showing a visible waiting state while local log trackers initialize.
 
 ## Data lookup order
 

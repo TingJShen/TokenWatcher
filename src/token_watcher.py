@@ -55,7 +55,8 @@ CODEX_USAGE_KEYS = (
     "reasoning_output_tokens",
     "total_tokens",
 )
-CODEX_CACHE_VERSION = 1
+CODEX_CACHE_VERSION = 2
+CLAUDE_CACHE_VERSION = 1
 USAGE_SNAPSHOT_CACHE_VERSION = 2
 
 
@@ -467,6 +468,21 @@ class CodexTailTracker:
                 for key, value in files.items()
                 if isinstance(value, dict)
             }
+            if str(payload.get("since") or "") == self.since.isoformat():
+                self.periods = ClaudeTailTracker._decode_periods(
+                    payload.get("periods")
+                )
+                self.call_periods = ClaudeTailTracker._decode_periods(
+                    payload.get("call_periods")
+                )
+                last_event = payload.get("last_event")
+                self.last_event = (
+                    parse_time(last_event).astimezone(timezone.utc)
+                    if last_event
+                    else None
+                )
+            else:
+                self.cache_dirty = True
         except FileNotFoundError:
             return
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -478,8 +494,12 @@ class CodexTailTracker:
         payload = {
             "version": CODEX_CACHE_VERSION,
             "updated_at": datetime.now(SHANGHAI).isoformat(),
+            "since": self.since.isoformat(),
             "fingerprints": sorted(self.seen),
             "files": self.cached_files,
+            "periods": ClaudeTailTracker._encode_periods(self.periods),
+            "call_periods": ClaudeTailTracker._encode_periods(self.call_periods),
+            "last_event": self.last_event.isoformat() if self.last_event else None,
         }
         temporary_path = self.cache_path.with_suffix(".tmp")
         try:
@@ -807,24 +827,146 @@ class ClaudeTailTracker:
         since: datetime,
         track_tokens: bool = True,
         watcher: DirectoryChangeWatcher | None = None,
+        call_since: datetime | None = None,
+        cache_path: Path | None = None,
     ):
         self.since = since.astimezone(timezone.utc)
+        self.call_since = (call_since or since).astimezone(timezone.utc)
+        self.scan_since = min(self.since, self.call_since)
         self.track_tokens = track_tokens
         self.root = Path.home() / ".claude" / "projects"
+        self.cache_path = cache_path or (
+            Path.home() / ".tokenwatcher" / "claude_tail_cache.json"
+        )
         self._owns_watcher = watcher is None
         self.watcher = watcher or DirectoryChangeWatcher(self.root)
         self.states: dict[Path, ClaudeFileState] = {}
         self.periods = empty_periods()
         self.call_periods = empty_periods()
         self.seen: set[tuple] = set()
+        self.cached_files: dict[str, dict] = {}
+        self.cache_dirty = False
         self.last_event: datetime | None = None
         self.errors = 0
+        self.cache_errors = 0
+        self._load_cache()
         self._discover_startup()
+        self._save_cache()
+
+    @staticmethod
+    def _encode_periods(periods: dict[str, Counter]) -> dict[str, list[dict]]:
+        return {
+            period: [
+                {"platform": key[0], "model": key[1], "value": int(value)}
+                for key, value in sorted(periods[period].items())
+            ]
+            for period in PERIODS
+        }
+
+    @staticmethod
+    def _decode_periods(payload: object) -> dict[str, Counter]:
+        periods = empty_periods()
+        if not isinstance(payload, dict):
+            return periods
+        for period in PERIODS:
+            for row in payload.get(period) or []:
+                if not isinstance(row, dict):
+                    continue
+                key = (str(row.get("platform") or "<unknown>"), str(row.get("model") or "<unknown>"))
+                periods[period][key] = int(row.get("value") or 0)
+        return periods
+
+    def _load_cache(self) -> None:
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            if int(payload.get("version") or 0) != CLAUDE_CACHE_VERSION:
+                return
+            if str(payload.get("token_since") or "") != self.since.isoformat():
+                return
+            if str(payload.get("call_since") or "") != self.call_since.isoformat():
+                return
+            if bool(payload.get("track_tokens", True)) != self.track_tokens:
+                return
+            self.periods = self._decode_periods(payload.get("periods"))
+            self.call_periods = self._decode_periods(payload.get("call_periods"))
+            self.seen = {
+                tuple(str(value) for value in row)
+                for row in payload.get("seen") or []
+                if isinstance(row, list) and len(row) == 3
+            }
+            self.cached_files = {
+                str(path): value
+                for path, value in (payload.get("files") or {}).items()
+                if isinstance(value, dict)
+            }
+            last_event = payload.get("last_event")
+            self.last_event = parse_time(last_event).astimezone(timezone.utc) if last_event else None
+        except (OSError, ValueError, TypeError, KeyError):
+            self.cache_errors += 1
+
+    def _save_cache(self) -> None:
+        if not self.cache_dirty:
+            return
+        payload = {
+            "version": CLAUDE_CACHE_VERSION,
+            "token_since": self.since.isoformat(),
+            "call_since": self.call_since.isoformat(),
+            "track_tokens": self.track_tokens,
+            "periods": self._encode_periods(self.periods),
+            "call_periods": self._encode_periods(self.call_periods),
+            "seen": [list(row) for row in sorted(self.seen)],
+            "last_event": self.last_event.isoformat() if self.last_event else None,
+            "files": self.cached_files,
+        }
+        temporary_path = self.cache_path.with_name(
+            f"{self.cache_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(temporary_path, self.cache_path)
+            self.cache_dirty = False
+        except OSError:
+            self.cache_errors += 1
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _state_from_cache(self, cached: dict, startup_cold: bool) -> ClaudeFileState:
+        try:
+            remainder = base64.b64decode(str(cached.get("remainder") or ""))
+        except (ValueError, TypeError):
+            remainder = b""
+        return ClaudeFileState(
+            offset=int(cached.get("offset") or 0),
+            remainder=remainder,
+            last_mtime=float(cached.get("mtime") or 0.0),
+            last_size=int(cached.get("size") or 0),
+            watching=not startup_cold,
+            stop_after_initial=startup_cold,
+        )
+
+    def _remember_file(self, path: Path, state: ClaudeFileState, stat) -> None:
+        entry = {
+            "offset": state.offset,
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+            "mtime_ns": stat.st_mtime_ns,
+            "remainder": base64.b64encode(state.remainder).decode("ascii"),
+        }
+        key = str(path)
+        if self.cached_files.get(key) != entry:
+            self.cached_files[key] = entry
+            self.cache_dirty = True
 
     def _discover_startup(self) -> None:
         if not self.root.exists():
             return
-        threshold = self.since.timestamp() - 5
+        threshold = self.scan_since.timestamp() - 5
         for path in self.root.rglob("*.jsonl"):
             try:
                 stat = path.stat()
@@ -833,8 +975,26 @@ class ClaudeTailTracker:
             except OSError:
                 continue
             startup_cold = stat.st_mtime < time.time() - STARTUP_HOT_SECONDS
-            state = ClaudeFileState(stop_after_initial=startup_cold)
+            cached = self.cached_files.get(str(path))
+            state = (
+                self._state_from_cache(cached, startup_cold)
+                if cached is not None
+                else ClaudeFileState(stop_after_initial=startup_cold)
+            )
             self.states[path] = state
+            if cached is not None:
+                exact = (
+                    int(cached.get("size") or -1) == stat.st_size
+                    and int(cached.get("mtime_ns") or -1) == stat.st_mtime_ns
+                    and state.offset == stat.st_size
+                )
+                if exact:
+                    state.last_size = stat.st_size
+                    state.last_mtime = stat.st_mtime
+                    continue
+                if stat.st_size <= state.offset:
+                    state.offset = 0
+                    state.remainder = b""
             self._read_path(path, state, initial=True)
 
     def _discover_changes(self) -> None:
@@ -873,7 +1033,7 @@ class ClaudeTailTracker:
             except (TypeError, ValueError):
                 self.errors += 1
                 continue
-            if event_time < self.since:
+            if event_time < self.scan_since:
                 continue
             total_tokens = int(usage.get("input_tokens") or 0) + int(
                 usage.get("output_tokens") or 0
@@ -888,10 +1048,12 @@ class ClaudeTailTracker:
             self.seen.add(fingerprint)
             key = ("Claude Code", model)
             event_date = event_time.astimezone(SHANGHAI).date()
-            if self.track_tokens:
+            if self.track_tokens and event_time >= self.since:
                 add_period_usage(self.periods, key, total_tokens, event_date)
-            add_period_usage(self.call_periods, key, 1, event_date)
+            if event_time >= self.call_since:
+                add_period_usage(self.call_periods, key, 1, event_date)
             self.last_event = max(self.last_event, event_time) if self.last_event else event_time
+            self.cache_dirty = True
 
     def _read_path(
         self,
@@ -918,6 +1080,7 @@ class ClaudeTailTracker:
                 if initial and state.stop_after_initial:
                     state.watching = False
                 state.next_check = now + REFRESH_SECONDS
+                self._remember_file(path, state, stat)
                 return
             with path.open("rb") as handle:
                 handle.seek(state.offset)
@@ -925,6 +1088,7 @@ class ClaudeTailTracker:
             state.offset = size
             state.next_check = now + REFRESH_SECONDS
             self._consume(data, state)
+            self._remember_file(path, state, stat)
             if initial and state.stop_after_initial:
                 state.watching = False
         except FileNotFoundError:
@@ -942,6 +1106,7 @@ class ClaudeTailTracker:
             self._read_path(path, state, now=now)
 
     def close(self) -> None:
+        self._save_cache()
         if self._owns_watcher:
             self.watcher.close()
 
@@ -1259,11 +1424,12 @@ class UsageEngine:
         self.baseline: Baseline | None = None
         self.codex: CodexTailTracker | None = None
         self.claude: ClaudeTailTracker | None = None
-        self.claude_calls: ClaudeTailTracker | None = None
         self.claude_usage = ClaudeUsageCache()
         self.claude_boundary: datetime | None = None
         self.cline: ClinePoller | None = None
         self._load_snapshot_cache()
+        if self.snapshot is None:
+            self._load_report_preview()
 
     def _load_snapshot_cache(self) -> None:
         try:
@@ -1278,6 +1444,25 @@ class UsageEngine:
             return
         self.snapshot = snapshot
         self.snapshot_cache_signature = usage_snapshot_signature(snapshot)
+
+    def _load_report_preview(self) -> None:
+        try:
+            baseline = load_baseline(self.report_dir)
+        except (OSError, ValueError, TypeError, KeyError):
+            return
+        if not any(baseline.periods[period] for period in PERIODS):
+            return
+        self.snapshot = UsageSnapshot(
+            periods={
+                period: dict(baseline.periods[period]) for period in PERIODS
+            },
+            call_periods={
+                period: dict(baseline.call_periods[period]) for period in PERIODS
+            },
+            updated_at=baseline.refreshed_at.astimezone(SHANGHAI),
+            report_time=baseline.refreshed_at.astimezone(SHANGHAI),
+            source_status=("Baseline report preview; live sources are loading",),
+        )
 
     def _save_snapshot_cache(self) -> None:
         snapshot = self.get_snapshot()
@@ -1314,8 +1499,6 @@ class UsageEngine:
             self.codex.close()
         if self.claude is not None:
             self.claude.close()
-        if self.claude_calls is not None:
-            self.claude_calls.close()
         if self.cline is not None:
             self.cline.close()
 
@@ -1324,12 +1507,12 @@ class UsageEngine:
         self._close_trackers()
         self.baseline = baseline
         self.codex = CodexTailTracker(self.baseline.refreshed_at)
-        self.claude = None
-        self.claude_calls = ClaudeTailTracker(
-            self.baseline.refreshed_at,
-            track_tokens=False,
+        _, _, claude_boundary = self.claude_usage.read()
+        self.claude = ClaudeTailTracker(
+            claude_boundary,
+            call_since=self.baseline.refreshed_at,
         )
-        self.claude_boundary = None
+        self.claude_boundary = claude_boundary
         self.cline = ClinePoller(self.baseline)
 
     def refresh_once(self) -> UsageSnapshot:
@@ -1340,16 +1523,18 @@ class UsageEngine:
                 self._reload()
             assert self.baseline is not None
             assert self.codex is not None
-            assert self.claude_calls is not None
+            assert self.claude is not None
             assert self.cline is not None
             self.codex.poll()
-            self.claude_calls.poll()
             self.cline.poll()
             claude_periods, claude_status, claude_boundary = self.claude_usage.read()
             if self.claude is None or self.claude_boundary != claude_boundary:
                 if self.claude is not None:
                     self.claude.close()
-                self.claude = ClaudeTailTracker(claude_boundary)
+                self.claude = ClaudeTailTracker(
+                    claude_boundary,
+                    call_since=self.baseline.refreshed_at,
+                )
                 self.claude_boundary = claude_boundary
             self.claude.poll()
             combined_periods = {}
@@ -1366,7 +1551,7 @@ class UsageEngine:
                 combined_periods[period] = dict(values)
                 calls = Counter(self.baseline.call_periods[period])
                 calls.update(self.codex.call_periods[period])
-                calls.update(self.claude_calls.call_periods[period])
+                calls.update(self.claude.call_periods[period])
                 for key in [key for key in calls if key[0] == "Cline"]:
                     del calls[key]
                 calls.update(self.cline.call_periods[period])
@@ -1772,6 +1957,7 @@ class LiveUsageApp:
         self.last_background_check = 0.0
         self.manual_foreground = False
         self.root = tk.Tk()
+        self.root.withdraw()
         self.root.title(APP_TITLE)
         self.root.overrideredirect(True)
         self.root.configure(bg=self.transparent)
@@ -1783,11 +1969,13 @@ class LiveUsageApp:
         self.screenshot_path = screenshot_path
         self._build()
         self._update_period_styles()
-        self._position_top_right()
         if self.engine.get_snapshot() is not None:
             self.manual_foreground = True
             self._refresh_ui(schedule=False)
             self.manual_foreground = False
+        self._position_top_right()
+        self.root.deiconify()
+        self.root.lift()
         self.engine.start()
         self.root.after(100, self._refresh_ui)
         if screenshot_path:
