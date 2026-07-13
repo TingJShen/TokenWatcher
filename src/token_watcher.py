@@ -46,6 +46,32 @@ CLINE_HISTORY = (
     / "taskHistory.json"
 )
 CLINE_TASKS = CLINE_HISTORY.parent.parent / "tasks"
+CODEX_USAGE_KEYS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def codex_usage_fingerprint(
+    session_id: str,
+    event_timestamp: object,
+    info: dict,
+) -> tuple:
+    last_usage = info.get("last_token_usage") or {}
+    total_usage = info.get("total_token_usage") or {}
+    last_values = tuple(int(last_usage.get(key) or 0) for key in CODEX_USAGE_KEYS)
+    total_values = tuple(int(total_usage.get(key) or 0) for key in CODEX_USAGE_KEYS)
+    if any(total_values):
+        return (session_id or "<unknown>", "cumulative", *total_values, *last_values)
+    return (
+        session_id or "<unknown>",
+        "timestamp",
+        str(event_timestamp or ""),
+        *last_values,
+    )
 
 
 class DirectoryChangeWatcher:
@@ -459,7 +485,8 @@ class CodexTailTracker:
                 continue
             if event.get("type") != "event_msg" or payload.get("type") != "token_count":
                 continue
-            usage = ((payload.get("info") or {}).get("last_token_usage"))
+            info = payload.get("info") or {}
+            usage = info.get("last_token_usage")
             if not isinstance(usage, dict):
                 continue
             try:
@@ -474,14 +501,13 @@ class CodexTailTracker:
                 total_tokens = int(usage.get("input_tokens") or 0) + int(
                     usage.get("output_tokens") or 0
                 )
+            if total_tokens <= 0:
+                continue
             model = state.model or "<unknown>"
-            fingerprint = (
-                state.session_id or "<unknown>",
+            fingerprint = codex_usage_fingerprint(
+                state.session_id,
                 event.get("timestamp"),
-                model,
-                int(usage.get("input_tokens") or 0),
-                int(usage.get("output_tokens") or 0),
-                total_tokens,
+                info,
             )
             if fingerprint in self.seen:
                 continue

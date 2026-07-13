@@ -39,7 +39,15 @@ class FakeWatcher:
 
 class TokenWatcherTests(unittest.TestCase):
     @staticmethod
-    def _codex_lines(session_id: str, total: int, timestamp: datetime) -> str:
+    def _codex_lines(
+        session_id: str,
+        total: int,
+        timestamp: datetime,
+        cumulative: int | None = None,
+    ) -> str:
+        info = {"last_token_usage": {"total_tokens": total}}
+        if cumulative is not None:
+            info["total_token_usage"] = {"total_tokens": cumulative}
         return "\n".join(
             (
                 json.dumps({"type": "session_meta", "payload": {"id": session_id}}),
@@ -52,7 +60,7 @@ class TokenWatcherTests(unittest.TestCase):
                         "timestamp": timestamp.isoformat(),
                         "payload": {
                             "type": "token_count",
-                            "info": {"last_token_usage": {"total_tokens": total}},
+                            "info": info,
                         },
                     }
                 ),
@@ -161,6 +169,46 @@ class TokenWatcherTests(unittest.TestCase):
             tracker.poll()
             self.assertEqual(
                 tracker.periods["cumulative"][("Codex", "gpt-test")], 30
+            )
+
+    def test_codex_repeated_cumulative_snapshots_are_counted_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            session_dir = home / ".codex" / "sessions" / "2026" / "07" / "14"
+            session_dir.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            original = session_dir / "original.jsonl"
+            forked = session_dir / "forked.jsonl"
+            original.write_text(
+                self._codex_lines("shared-session", 10, now, cumulative=10),
+                encoding="utf-8",
+            )
+            forked.write_text(
+                self._codex_lines(
+                    "shared-session",
+                    10,
+                    now + timedelta(seconds=1),
+                    cumulative=10,
+                )
+                + self._codex_lines(
+                    "shared-session",
+                    20,
+                    now + timedelta(seconds=2),
+                    cumulative=30,
+                ),
+                encoding="utf-8",
+            )
+            watcher = FakeWatcher()
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                tracker = token_watcher.CodexTailTracker(
+                    now - timedelta(days=1), watcher=watcher
+                )
+
+            self.assertEqual(
+                tracker.periods["cumulative"][("Codex", "gpt-test")], 30
+            )
+            self.assertEqual(
+                tracker.call_periods["cumulative"][("Codex", "gpt-test")], 2
             )
 
     def test_claude_runtime_changes_do_not_rescan_tree(self) -> None:
