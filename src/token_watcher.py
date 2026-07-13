@@ -18,6 +18,9 @@ APP_TITLE = "TokenWatcher"
 INSTANCE_MUTEX_NAME = "Local\\TokenWatcher.Singleton"
 START_DATE = date(2026, 2, 1)
 REFRESH_SECONDS = 0.5
+DISCOVERY_SECONDS = 10.0
+HOT_FILE_SECONDS = 120.0
+COLD_FILE_CHECK_SECONDS = 10.0
 SHANGHAI = timezone(timedelta(hours=8))
 PERIODS = ("today", "week", "month", "cumulative")
 PERIOD_LABELS = {
@@ -227,6 +230,10 @@ class CodexFileState:
     remainder: bytes = b""
     model: str = "<unknown>"
     session_id: str = ""
+    last_mtime: float = 0.0
+    last_size: int = 0
+    next_check: float = 0.0
+    hot_until: float = 0.0
 
 
 class CodexTailTracker:
@@ -259,7 +266,7 @@ class CodexTailTracker:
 
     def _discover(self, force: bool = False) -> None:
         now = time.monotonic()
-        if not force and now - self.last_discovery < 3.0:
+        if not force and now - self.last_discovery < DISCOVERY_SECONDS:
             return
         self.last_discovery = now
         for path in self._paths():
@@ -332,30 +339,50 @@ class CodexTailTracker:
             )
             self.last_event = max(self.last_event, event_time) if self.last_event else event_time
 
-    def _read_path(self, path: Path, state: CodexFileState, initial: bool = False) -> None:
+    def _read_path(
+        self,
+        path: Path,
+        state: CodexFileState,
+        initial: bool = False,
+        now: float | None = None,
+    ) -> None:
+        now = time.monotonic() if now is None else now
+        if not initial and now < state.next_check:
+            return
         try:
-            size = path.stat().st_size
+            stat = path.stat()
+            size = stat.st_size
+            mtime = stat.st_mtime
             if size < state.offset:
                 state.offset = 0
                 state.remainder = b""
+            changed = size != state.last_size or mtime != state.last_mtime
+            state.last_size = size
+            state.last_mtime = mtime
             if size == state.offset:
+                interval = REFRESH_SECONDS if now < state.hot_until else COLD_FILE_CHECK_SECONDS
+                state.next_check = now + interval
                 return
             with path.open("rb") as handle:
                 handle.seek(state.offset)
                 data = handle.read()
             state.offset = size
+            state.hot_until = now + HOT_FILE_SECONDS
+            state.next_check = now + REFRESH_SECONDS
             self._consume(data, state, initial)
+            if not changed:
+                state.next_check = now + COLD_FILE_CHECK_SECONDS
         except OSError:
             self.errors += 1
 
     def poll(self) -> None:
         self._discover()
+        now = time.monotonic()
         for path, state in list(self.states.items()):
-            self._read_path(path, state)
+            self._read_path(path, state, now=now)
 
 
-def read_claude_usage() -> tuple[dict[str, Counter], str, datetime]:
-    stats_path = Path.home() / ".claude" / "stats-cache.json"
+def _parse_claude_usage(stats_path: Path) -> tuple[dict[str, Counter], str, datetime]:
     periods = empty_periods()
     if not stats_path.exists():
         boundary = datetime.now(SHANGHAI).replace(
@@ -395,10 +422,32 @@ def read_claude_usage() -> tuple[dict[str, Counter], str, datetime]:
     )
 
 
+class ClaudeUsageCache:
+    def __init__(self):
+        self.stats_path = Path.home() / ".claude" / "stats-cache.json"
+        self.last_signature: tuple[float, int] | None = None
+        self.cached: tuple[dict[str, Counter], str, datetime] | None = None
+
+    def read(self) -> tuple[dict[str, Counter], str, datetime]:
+        try:
+            stat = self.stats_path.stat()
+            signature = (stat.st_mtime, stat.st_size)
+        except OSError:
+            signature = (0.0, 0)
+        if self.cached is None or signature != self.last_signature:
+            self.cached = _parse_claude_usage(self.stats_path)
+            self.last_signature = signature
+        return self.cached
+
+
 @dataclass
 class ClaudeFileState:
     offset: int = 0
     remainder: bytes = b""
+    last_mtime: float = 0.0
+    last_size: int = 0
+    next_check: float = 0.0
+    hot_until: float = 0.0
 
 
 class ClaudeTailTracker:
@@ -417,7 +466,7 @@ class ClaudeTailTracker:
 
     def _discover(self, force: bool = False) -> None:
         now = time.monotonic()
-        if not force and now - self.last_discovery < 3.0:
+        if not force and now - self.last_discovery < DISCOVERY_SECONDS:
             return
         self.last_discovery = now
         if not self.root.exists():
@@ -477,26 +526,46 @@ class ClaudeTailTracker:
             add_period_usage(self.call_periods, key, 1, event_date)
             self.last_event = max(self.last_event, event_time) if self.last_event else event_time
 
-    def _read_path(self, path: Path, state: ClaudeFileState) -> None:
+    def _read_path(
+        self,
+        path: Path,
+        state: ClaudeFileState,
+        now: float | None = None,
+    ) -> None:
+        now = time.monotonic() if now is None else now
+        if now < state.next_check:
+            return
         try:
-            size = path.stat().st_size
+            stat = path.stat()
+            size = stat.st_size
+            mtime = stat.st_mtime
             if size < state.offset:
                 state.offset = 0
                 state.remainder = b""
+            changed = size != state.last_size or mtime != state.last_mtime
+            state.last_size = size
+            state.last_mtime = mtime
             if size == state.offset:
+                interval = REFRESH_SECONDS if now < state.hot_until else COLD_FILE_CHECK_SECONDS
+                state.next_check = now + interval
                 return
             with path.open("rb") as handle:
                 handle.seek(state.offset)
                 data = handle.read()
             state.offset = size
+            state.hot_until = now + HOT_FILE_SECONDS
+            state.next_check = now + REFRESH_SECONDS
             self._consume(data, state)
+            if not changed:
+                state.next_check = now + COLD_FILE_CHECK_SECONDS
         except OSError:
             self.errors += 1
 
     def poll(self) -> None:
         self._discover()
+        now = time.monotonic()
         for path, state in list(self.states.items()):
-            self._read_path(path, state)
+            self._read_path(path, state, now=now)
 
 
 def load_cline_tasks() -> dict[str, tuple[str, int, datetime]]:
@@ -514,6 +583,23 @@ def load_cline_tasks() -> dict[str, tuple[str, int, datetime]]:
         ).astimezone(SHANGHAI)
         tasks[task_id] = (model, total, timestamp)
     return tasks
+
+
+class ClineTaskCache:
+    def __init__(self):
+        self.last_signature: tuple[float, int] | None = None
+        self.cached: dict[str, tuple[str, int, datetime]] = {}
+
+    def read(self) -> dict[str, tuple[str, int, datetime]]:
+        try:
+            stat = CLINE_HISTORY.stat()
+            signature = (stat.st_mtime, stat.st_size)
+        except OSError:
+            signature = (0.0, 0)
+        if signature != self.last_signature:
+            self.cached = load_cline_tasks()
+            self.last_signature = signature
+        return dict(self.cached)
 
 
 class ClineRequestCounter:
@@ -547,8 +633,7 @@ class ClineRequestCounter:
             add_period_usage(periods, ("Cline", model), 1, event_date.date())
         return periods
 
-    def poll(self) -> None:
-        tasks = load_cline_tasks()
+    def poll(self, tasks: dict[str, tuple[str, int, datetime]]) -> None:
         active_paths = set()
         for task_id, (model, _total, _timestamp) in tasks.items():
             path = CLINE_TASKS / task_id / "ui_messages.json"
@@ -596,7 +681,8 @@ class ClinePoller:
             for period in PERIODS
         }
         self.report_time = baseline.refreshed_at.astimezone(SHANGHAI)
-        self.initial_tasks = load_cline_tasks()
+        self.task_cache = ClineTaskCache()
+        self.initial_tasks = self.task_cache.read()
         initial_by_model = Counter()
         for model, total, _ in self.initial_tasks.values():
             initial_by_model[("Cline", model)] += total
@@ -618,8 +704,8 @@ class ClinePoller:
         self.poll()
 
     def poll(self) -> None:
-        current_tasks = load_cline_tasks()
-        self.request_counter.poll()
+        current_tasks = self.task_cache.read()
+        self.request_counter.poll(current_tasks)
         current_by_model = Counter()
         delta_periods = empty_periods()
         for task_id, (model, total, timestamp) in current_tasks.items():
@@ -681,6 +767,7 @@ class UsageEngine:
         self.codex: CodexTailTracker | None = None
         self.claude: ClaudeTailTracker | None = None
         self.claude_calls: ClaudeTailTracker | None = None
+        self.claude_usage = ClaudeUsageCache()
         self.claude_boundary: datetime | None = None
         self.cline: ClinePoller | None = None
 
@@ -708,7 +795,7 @@ class UsageEngine:
             self.codex.poll()
             self.claude_calls.poll()
             self.cline.poll()
-            claude_periods, claude_status, claude_boundary = read_claude_usage()
+            claude_periods, claude_status, claude_boundary = self.claude_usage.read()
             if self.claude is None or self.claude_boundary != claude_boundary:
                 self.claude = ClaudeTailTracker(claude_boundary)
                 self.claude_boundary = claude_boundary

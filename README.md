@@ -1,12 +1,13 @@
 # TokenWatcher
 
-TokenWatcher is a lightweight Windows desktop overlay that displays the three most-used AI models and their exact token counts. It reads local Codex, Claude Code, and Cline usage data and refreshes every 0.5 seconds.
+TokenWatcher is a lightweight Windows desktop overlay that displays the three most-used AI models and their exact token counts. It reads local Codex, Claude Code, and Cline usage data and refreshes the overlay every 0.5 seconds while using incremental disk checks for local logs.
 
 ## Features
 
 - Top-three models for today, this week, this month, or all time
 - Exact token totals without K/M/B abbreviation
 - Per-model request counts
+- Incremental log tailing with cached summary/task files
 - Green rolling animation when a value increases
 - Transparent, always-on-top, draggable window
 - Automatic black/white text selection based on the desktop background

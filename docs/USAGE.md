@@ -9,7 +9,7 @@
 
 ## Refresh behavior
 
-The data engine checks local usage files every 0.5 seconds. When a model's token count or request count increases, the previous value rolls upward and the new value briefly appears in green. The corresponding model name also flashes green when its token total increases.
+The overlay updates every 0.5 seconds. The data engine tails changed Codex and Claude Code log files from their previous byte offsets, keeps recently active files hot, checks cold files less often, and only reparses Claude/Cline summary JSON when file metadata changes. When a model's token count or request count increases, the previous value rolls upward and the new value briefly appears in green. The corresponding model name also flashes green when its token total increases.
 
 ## Data lookup order
 
