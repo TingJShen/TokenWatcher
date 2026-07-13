@@ -1,0 +1,1454 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import sys
+import threading
+import time
+import tkinter as tk
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+
+APP_TITLE = "TokenWatcher"
+INSTANCE_MUTEX_NAME = "Local\\TokenWatcher.Singleton"
+START_DATE = date(2026, 2, 1)
+REFRESH_SECONDS = 0.5
+SHANGHAI = timezone(timedelta(hours=8))
+PERIODS = ("today", "week", "month", "cumulative")
+PERIOD_LABELS = {
+    "today": "本日",
+    "week": "本周",
+    "month": "本月",
+    "cumulative": "累计",
+}
+PLATFORM_COLORS = {
+    "Codex": "#4C8DFF",
+    "Claude Code": "#F59E42",
+    "Cline": "#26C6A2",
+}
+REPORT_FOLDER_NAME = "codex_claude_usage_since_2026-02"
+CLINE_HISTORY = (
+    Path.home()
+    / "AppData"
+    / "Roaming"
+    / "Code"
+    / "User"
+    / "globalStorage"
+    / "saoudrizwan.claude-dev"
+    / "state"
+    / "taskHistory.json"
+)
+CLINE_TASKS = CLINE_HISTORY.parent.parent / "tasks"
+
+
+def enable_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+
+
+def acquire_single_instance_mutex():
+    if os.name != "nt":
+        return True
+    import ctypes
+
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, INSTANCE_MUTEX_NAME)
+    if not handle:
+        return None
+    if ctypes.windll.kernel32.GetLastError() == 183:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
+def release_single_instance_mutex(handle) -> None:
+    if os.name == "nt" and handle not in (None, True):
+        import ctypes
+
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def parse_time(value: str | None) -> datetime:
+    if not value:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=SHANGHAI)
+    return parsed
+
+
+def format_tokens(value: int) -> str:
+    return f"{int(value):,}"
+
+
+def compact_model_name(model: str) -> str:
+    name = model.strip()
+    lower = name.lower()
+    if lower.startswith("gpt-"):
+        name = lower.removeprefix("gpt-").replace("codex", "cdx")
+    elif lower.startswith("claude-"):
+        name = lower.removeprefix("claude-")
+        name = name.replace("sonnet", "son").replace("deepseek", "ds")
+        if name.endswith(tuple(f"-{year}" for year in range(2020, 2031))):
+            name = name.rsplit("-", 1)[0]
+        parts = name.split("-")
+        if len(parts) >= 3 and parts[-2].isdigit() and parts[-1].isdigit():
+            name = "-".join(parts[:-2]) + f"-{parts[-2]}.{parts[-1]}"
+    elif lower.startswith("deepseek-"):
+        name = "ds-" + lower.removeprefix("deepseek-")
+    elif lower.startswith("glm-"):
+        name = name.upper()
+    if len(name) > 9:
+        return f"{name[:8]}…"
+    return name
+
+
+def empty_periods() -> dict[str, Counter]:
+    return {period: Counter() for period in PERIODS}
+
+
+def active_periods(event_date: date, now_date: date | None = None) -> tuple[str, ...]:
+    now_date = now_date or datetime.now(SHANGHAI).date()
+    periods = ["cumulative"]
+    if event_date.year == now_date.year and event_date.month == now_date.month:
+        periods.append("month")
+    week_start = now_date - timedelta(days=now_date.weekday())
+    if week_start <= event_date <= now_date:
+        periods.append("week")
+    if event_date == now_date:
+        periods.append("today")
+    return tuple(periods)
+
+
+def add_period_usage(
+    periods: dict[str, Counter],
+    key: tuple[str, str],
+    tokens: int,
+    event_date: date,
+) -> None:
+    for period in active_periods(event_date):
+        periods[period][key] += int(tokens)
+
+
+def find_report_dir() -> Path:
+    configured = os.environ.get("AI_USAGE_REPORT_DIR")
+    candidates = [Path(configured).expanduser()] if configured else []
+    if getattr(sys, "frozen", False):
+        executable_root = Path(sys.executable).resolve().parent
+        candidates.extend(
+            [
+                executable_root / "outputs" / REPORT_FOLDER_NAME,
+                executable_root.parent / "outputs" / REPORT_FOLDER_NAME,
+            ]
+        )
+    else:
+        root = Path(__file__).resolve().parents[1]
+        candidates.append(root / "outputs" / REPORT_FOLDER_NAME)
+    candidates.extend(
+        [
+            Path.cwd() / "outputs" / REPORT_FOLDER_NAME,
+            Path.home() / ".tokenwatcher" / REPORT_FOLDER_NAME,
+        ]
+    )
+    for candidate in candidates:
+        if (candidate / "model_total.csv").exists():
+            return candidate
+    return candidates[0]
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+@dataclass
+class Baseline:
+    report_dir: Path
+    refreshed_at: datetime
+    periods: dict[str, Counter] = field(default_factory=empty_periods)
+    call_periods: dict[str, Counter] = field(default_factory=empty_periods)
+    report_mtime: float = 0.0
+
+
+def load_baseline(report_dir: Path) -> Baseline:
+    summary_path = report_dir / "summary.json"
+    if not summary_path.exists():
+        return Baseline(
+            report_dir=report_dir,
+            refreshed_at=datetime.combine(
+                START_DATE,
+                datetime.min.time(),
+                tzinfo=SHANGHAI,
+            ),
+        )
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    baseline = Baseline(
+        report_dir=report_dir,
+        refreshed_at=parse_time(summary.get("refreshed_at_shanghai")),
+        report_mtime=summary_path.stat().st_mtime,
+    )
+    model_total_path = report_dir / "model_total.csv"
+    if model_total_path.exists():
+        for row in read_csv(model_total_path):
+            baseline.periods["cumulative"][(row["platform"], row["model"])] += int(
+                row["total_tokens"]
+            )
+    now_date = datetime.now(SHANGHAI).date()
+    daily_path = report_dir / "daily_by_platform_model.csv"
+    if daily_path.exists():
+        for row in read_csv(daily_path):
+            row_date = date.fromisoformat(row["date"])
+            key = (row["platform"], row["model"])
+            tokens = int(row["total_tokens"])
+            calls = int(row.get("responses") or 0)
+            for period in active_periods(row_date, now_date):
+                baseline.call_periods[period][key] += calls
+                if period != "cumulative":
+                    baseline.periods[period][key] += tokens
+    return baseline
+
+
+@dataclass
+class CodexFileState:
+    offset: int = 0
+    remainder: bytes = b""
+    model: str = "<unknown>"
+    session_id: str = ""
+
+
+class CodexTailTracker:
+    def __init__(self, since: datetime):
+        self.since = since.astimezone(timezone.utc)
+        self.root = Path.home() / ".codex"
+        self.states: dict[Path, CodexFileState] = {}
+        self.periods = empty_periods()
+        self.call_periods = empty_periods()
+        self.seen: set[tuple] = set()
+        self.last_event: datetime | None = None
+        self.last_discovery = 0.0
+        self.errors = 0
+        self._discover(force=True)
+
+    def _paths(self) -> list[Path]:
+        paths = []
+        threshold = self.since.timestamp() - 5
+        for folder_name in ("sessions", "archived_sessions"):
+            folder = self.root / folder_name
+            if not folder.exists():
+                continue
+            for path in folder.rglob("*.jsonl"):
+                try:
+                    if path.stat().st_mtime >= threshold:
+                        paths.append(path)
+                except OSError:
+                    continue
+        return paths
+
+    def _discover(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_discovery < 3.0:
+            return
+        self.last_discovery = now
+        for path in self._paths():
+            if path in self.states:
+                continue
+            state = CodexFileState()
+            self.states[path] = state
+            self._read_path(path, state, initial=True)
+
+    def _consume(self, data: bytes, state: CodexFileState, initial: bool) -> None:
+        data = state.remainder + data
+        lines = data.split(b"\n")
+        state.remainder = lines.pop() if data and not data.endswith(b"\n") else b""
+        for raw_line in lines:
+            if not raw_line.strip():
+                continue
+            try:
+                event = json.loads(raw_line.decode("utf-8", errors="replace"))
+            except (TypeError, json.JSONDecodeError):
+                self.errors += 1
+                continue
+            payload = event.get("payload") or {}
+            if event.get("type") == "session_meta":
+                state.session_id = str(payload.get("id") or state.session_id)
+                continue
+            if event.get("type") == "turn_context":
+                state.model = str(payload.get("model") or state.model)
+                continue
+            if event.get("type") != "event_msg" or payload.get("type") != "token_count":
+                continue
+            usage = ((payload.get("info") or {}).get("last_token_usage"))
+            if not isinstance(usage, dict):
+                continue
+            try:
+                event_time = parse_time(event.get("timestamp")).astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                self.errors += 1
+                continue
+            if event_time <= self.since:
+                continue
+            total_tokens = int(usage.get("total_tokens") or 0)
+            if not total_tokens:
+                total_tokens = int(usage.get("input_tokens") or 0) + int(
+                    usage.get("output_tokens") or 0
+                )
+            model = state.model or "<unknown>"
+            fingerprint = (
+                state.session_id or "<unknown>",
+                event.get("timestamp"),
+                model,
+                int(usage.get("input_tokens") or 0),
+                int(usage.get("output_tokens") or 0),
+                total_tokens,
+            )
+            if fingerprint in self.seen:
+                continue
+            self.seen.add(fingerprint)
+            key = ("Codex", model)
+            add_period_usage(
+                self.periods,
+                key,
+                total_tokens,
+                event_time.astimezone(SHANGHAI).date(),
+            )
+            add_period_usage(
+                self.call_periods,
+                key,
+                1,
+                event_time.astimezone(SHANGHAI).date(),
+            )
+            self.last_event = max(self.last_event, event_time) if self.last_event else event_time
+
+    def _read_path(self, path: Path, state: CodexFileState, initial: bool = False) -> None:
+        try:
+            size = path.stat().st_size
+            if size < state.offset:
+                state.offset = 0
+                state.remainder = b""
+            if size == state.offset:
+                return
+            with path.open("rb") as handle:
+                handle.seek(state.offset)
+                data = handle.read()
+            state.offset = size
+            self._consume(data, state, initial)
+        except OSError:
+            self.errors += 1
+
+    def poll(self) -> None:
+        self._discover()
+        for path, state in list(self.states.items()):
+            self._read_path(path, state)
+
+
+def read_claude_usage() -> tuple[dict[str, Counter], str, datetime]:
+    stats_path = Path.home() / ".claude" / "stats-cache.json"
+    periods = empty_periods()
+    if not stats_path.exists():
+        boundary = datetime.now(SHANGHAI).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return periods, "Claude stats-cache 不存在", boundary
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    for model, usage in stats.get("modelUsage", {}).items():
+        periods["cumulative"][("Claude Code", model)] = int(usage.get("inputTokens") or 0) + int(
+            usage.get("outputTokens") or 0
+        )
+    for row in stats.get("dailyModelTokens", []):
+        try:
+            row_date = date.fromisoformat(row["date"])
+        except (KeyError, ValueError):
+            continue
+        for model, tokens in (row.get("tokensByModel") or {}).items():
+            key = ("Claude Code", model)
+            for period in active_periods(row_date):
+                if period != "cumulative":
+                    periods[period][key] += int(tokens or 0)
+    last_date_text = stats.get("lastComputedDate")
+    if last_date_text:
+        boundary = datetime.combine(
+            date.fromisoformat(last_date_text) + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=SHANGHAI,
+        )
+    else:
+        boundary = datetime.now(SHANGHAI).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    return (
+        periods,
+        f"Claude /status：{last_date_text or '未知日期'}",
+        boundary,
+    )
+
+
+@dataclass
+class ClaudeFileState:
+    offset: int = 0
+    remainder: bytes = b""
+
+
+class ClaudeTailTracker:
+    def __init__(self, since: datetime, track_tokens: bool = True):
+        self.since = since.astimezone(timezone.utc)
+        self.track_tokens = track_tokens
+        self.root = Path.home() / ".claude" / "projects"
+        self.states: dict[Path, ClaudeFileState] = {}
+        self.periods = empty_periods()
+        self.call_periods = empty_periods()
+        self.seen: set[tuple] = set()
+        self.last_event: datetime | None = None
+        self.last_discovery = 0.0
+        self.errors = 0
+        self._discover(force=True)
+
+    def _discover(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_discovery < 3.0:
+            return
+        self.last_discovery = now
+        if not self.root.exists():
+            return
+        threshold = self.since.timestamp() - 5
+        for path in self.root.rglob("*.jsonl"):
+            try:
+                if path.stat().st_mtime < threshold or path in self.states:
+                    continue
+            except OSError:
+                continue
+            state = ClaudeFileState()
+            self.states[path] = state
+            self._read_path(path, state)
+
+    def _consume(self, data: bytes, state: ClaudeFileState) -> None:
+        data = state.remainder + data
+        lines = data.split(b"\n")
+        state.remainder = lines.pop() if data and not data.endswith(b"\n") else b""
+        for raw_line in lines:
+            if not raw_line.strip():
+                continue
+            try:
+                event = json.loads(raw_line.decode("utf-8", errors="replace"))
+            except (TypeError, json.JSONDecodeError):
+                self.errors += 1
+                continue
+            message = event.get("message") or {}
+            usage = message.get("usage")
+            if event.get("type") != "assistant" or not isinstance(usage, dict):
+                continue
+            model = str(message.get("model") or "<unknown>")
+            if model == "<synthetic>":
+                continue
+            try:
+                event_time = parse_time(event.get("timestamp")).astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                self.errors += 1
+                continue
+            if event_time < self.since:
+                continue
+            total_tokens = int(usage.get("input_tokens") or 0) + int(
+                usage.get("output_tokens") or 0
+            )
+            fingerprint = (
+                str(event.get("sessionId") or "<unknown>"),
+                str(message.get("id") or event.get("uuid") or "<unknown>"),
+                model,
+            )
+            if fingerprint in self.seen:
+                continue
+            self.seen.add(fingerprint)
+            key = ("Claude Code", model)
+            event_date = event_time.astimezone(SHANGHAI).date()
+            if self.track_tokens:
+                add_period_usage(self.periods, key, total_tokens, event_date)
+            add_period_usage(self.call_periods, key, 1, event_date)
+            self.last_event = max(self.last_event, event_time) if self.last_event else event_time
+
+    def _read_path(self, path: Path, state: ClaudeFileState) -> None:
+        try:
+            size = path.stat().st_size
+            if size < state.offset:
+                state.offset = 0
+                state.remainder = b""
+            if size == state.offset:
+                return
+            with path.open("rb") as handle:
+                handle.seek(state.offset)
+                data = handle.read()
+            state.offset = size
+            self._consume(data, state)
+        except OSError:
+            self.errors += 1
+
+    def poll(self) -> None:
+        self._discover()
+        for path, state in list(self.states.items()):
+            self._read_path(path, state)
+
+
+def load_cline_tasks() -> dict[str, tuple[str, int, datetime]]:
+    if not CLINE_HISTORY.exists():
+        return {}
+    data = json.loads(CLINE_HISTORY.read_text(encoding="utf-8"))
+    history = data if isinstance(data, list) else data.get("taskHistory") or []
+    tasks = {}
+    for task in history:
+        task_id = str(task.get("id") or task.get("ulid") or "<unknown>")
+        model = str(task.get("modelId") or "<unknown>")
+        total = int(task.get("tokensIn") or 0) + int(task.get("tokensOut") or 0)
+        timestamp = datetime.fromtimestamp(
+            int(task.get("ts") or 0) / 1000, timezone.utc
+        ).astimezone(SHANGHAI)
+        tasks[task_id] = (model, total, timestamp)
+    return tasks
+
+
+class ClineRequestCounter:
+    def __init__(self, since: datetime):
+        self.since = since.astimezone(SHANGHAI)
+        self.states: dict[Path, tuple[float, dict[str, Counter]]] = {}
+        self.periods = empty_periods()
+
+    def _parse_path(self, path: Path, fallback_model: str) -> dict[str, Counter]:
+        periods = empty_periods()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, json.JSONDecodeError):
+            return periods
+        messages = data if isinstance(data, list) else data.get("messages") or data.get("uiMessages") or []
+        for event in messages:
+            if event.get("type") != "say" or event.get("say") != "api_req_started":
+                continue
+            try:
+                payload = json.loads(event.get("text") or "{}")
+                if not any(metric in payload for metric in ("tokensIn", "tokensOut", "cacheReads", "cacheWrites")):
+                    continue
+                event_date = datetime.fromtimestamp(
+                    int(event["ts"]) / 1000, timezone.utc
+                ).astimezone(SHANGHAI)
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+                continue
+            if event_date <= self.since:
+                continue
+            model = str((event.get("modelInfo") or {}).get("modelId") or fallback_model)
+            add_period_usage(periods, ("Cline", model), 1, event_date.date())
+        return periods
+
+    def poll(self) -> None:
+        tasks = load_cline_tasks()
+        active_paths = set()
+        for task_id, (model, _total, _timestamp) in tasks.items():
+            path = CLINE_TASKS / task_id / "ui_messages.json"
+            if not path.exists():
+                continue
+            active_paths.add(path)
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime <= self.since.timestamp():
+                continue
+            previous = self.states.get(path)
+            if previous is None or previous[0] != mtime:
+                self.states[path] = (mtime, self._parse_path(path, model))
+        for path in set(self.states) - active_paths:
+            del self.states[path]
+        combined = empty_periods()
+        for _mtime, path_periods in self.states.values():
+            for period in PERIODS:
+                combined[period].update(path_periods[period])
+        self.periods = combined
+
+
+class ClinePoller:
+    def __init__(self, baseline: Baseline):
+        self.baseline_periods = {
+            period: Counter(
+                {
+                    key: value
+                    for key, value in baseline.periods[period].items()
+                    if key[0] == "Cline"
+                }
+            )
+            for period in PERIODS
+        }
+        self.baseline_call_periods = {
+            period: Counter(
+                {
+                    key: value
+                    for key, value in baseline.call_periods[period].items()
+                    if key[0] == "Cline"
+                }
+            )
+            for period in PERIODS
+        }
+        self.report_time = baseline.refreshed_at.astimezone(SHANGHAI)
+        self.initial_tasks = load_cline_tasks()
+        initial_by_model = Counter()
+        for model, total, _ in self.initial_tasks.values():
+            initial_by_model[("Cline", model)] += total
+        self.offsets = Counter()
+        for key in set(initial_by_model) | set(self.baseline_periods["cumulative"]):
+            self.offsets[key] = max(
+                self.baseline_periods["cumulative"][key], initial_by_model[key]
+            ) - initial_by_model[key]
+        self.periods = {
+            period: Counter(values)
+            for period, values in self.baseline_periods.items()
+        }
+        self.request_counter = ClineRequestCounter(self.report_time)
+        self.call_periods = {
+            period: Counter(values)
+            for period, values in self.baseline_call_periods.items()
+        }
+        self.status = "Cline taskHistory 已载入"
+        self.poll()
+
+    def poll(self) -> None:
+        current_tasks = load_cline_tasks()
+        self.request_counter.poll()
+        current_by_model = Counter()
+        delta_periods = empty_periods()
+        for task_id, (model, total, timestamp) in current_tasks.items():
+            key = ("Cline", model)
+            current_by_model[key] += total
+            initial_total = self.initial_tasks.get(task_id, (model, 0, timestamp))[1]
+            delta = max(0, total - initial_total)
+            if delta:
+                add_period_usage(delta_periods, key, delta, timestamp.date())
+            if task_id not in self.initial_tasks and timestamp > self.report_time:
+                add_period_usage(
+                    delta_periods,
+                    key,
+                    max(0, total - delta),
+                    timestamp.date(),
+                )
+        cumulative = Counter()
+        for key in set(current_by_model) | set(self.baseline_periods["cumulative"]):
+            cumulative[key] = current_by_model[key] + self.offsets[key]
+        self.periods = {
+            "cumulative": cumulative,
+            "today": self.baseline_periods["today"] + delta_periods["today"],
+            "week": self.baseline_periods["week"] + delta_periods["week"],
+            "month": self.baseline_periods["month"] + delta_periods["month"],
+        }
+        self.call_periods = {
+            period: self.baseline_call_periods[period]
+            + self.request_counter.periods[period]
+            for period in PERIODS
+        }
+        self.status = f"Cline 任务：{len(current_tasks)}"
+
+
+@dataclass(frozen=True)
+class UsageSnapshot:
+    periods: dict[str, dict[tuple[str, str], int]]
+    call_periods: dict[str, dict[tuple[str, str], int]]
+    updated_at: datetime
+    report_time: datetime
+    source_status: tuple[str, ...]
+    error: str = ""
+
+    def top(self, period: str) -> list[tuple[tuple[str, str], int]]:
+        values = self.periods.get(period, {})
+        return sorted(values.items(), key=lambda item: item[1], reverse=True)[:3]
+
+    def call_count(self, period: str) -> int:
+        return sum(self.call_periods.get(period, {}).values())
+
+
+class UsageEngine:
+    def __init__(self, report_dir: Path | None = None):
+        self.report_dir = report_dir or find_report_dir()
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.snapshot: UsageSnapshot | None = None
+        self.thread: threading.Thread | None = None
+        self.baseline: Baseline | None = None
+        self.codex: CodexTailTracker | None = None
+        self.claude: ClaudeTailTracker | None = None
+        self.claude_calls: ClaudeTailTracker | None = None
+        self.claude_boundary: datetime | None = None
+        self.cline: ClinePoller | None = None
+
+    def _reload(self) -> None:
+        self.baseline = load_baseline(self.report_dir)
+        self.codex = CodexTailTracker(self.baseline.refreshed_at)
+        self.claude = None
+        self.claude_calls = ClaudeTailTracker(
+            self.baseline.refreshed_at,
+            track_tokens=False,
+        )
+        self.claude_boundary = None
+        self.cline = ClinePoller(self.baseline)
+
+    def refresh_once(self) -> UsageSnapshot:
+        try:
+            summary_path = self.report_dir / "summary.json"
+            current_mtime = summary_path.stat().st_mtime if summary_path.exists() else 0.0
+            if self.baseline is None or current_mtime != self.baseline.report_mtime:
+                self._reload()
+            assert self.baseline is not None
+            assert self.codex is not None
+            assert self.claude_calls is not None
+            assert self.cline is not None
+            self.codex.poll()
+            self.claude_calls.poll()
+            self.cline.poll()
+            claude_periods, claude_status, claude_boundary = read_claude_usage()
+            if self.claude is None or self.claude_boundary != claude_boundary:
+                self.claude = ClaudeTailTracker(claude_boundary)
+                self.claude_boundary = claude_boundary
+            self.claude.poll()
+            combined_periods = {}
+            combined_call_periods = {}
+            for period in PERIODS:
+                values = Counter(self.baseline.periods[period])
+                values.update(self.codex.periods[period])
+                for key in [key for key in values if key[0] == "Claude Code"]:
+                    del values[key]
+                values.update(claude_periods[period] + self.claude.periods[period])
+                for key in [key for key in values if key[0] == "Cline"]:
+                    del values[key]
+                values.update(self.cline.periods[period])
+                combined_periods[period] = dict(values)
+                calls = Counter(self.baseline.call_periods[period])
+                calls.update(self.codex.call_periods[period])
+                calls.update(self.claude_calls.call_periods[period])
+                for key in [key for key in calls if key[0] == "Cline"]:
+                    del calls[key]
+                calls.update(self.cline.call_periods[period])
+                combined_call_periods[period] = dict(calls)
+            last_event = (
+                self.codex.last_event.astimezone(SHANGHAI).strftime("%H:%M:%S")
+                if self.codex.last_event
+                else "无新增"
+            )
+            claude_last_event = (
+                self.claude.last_event.astimezone(SHANGHAI).strftime("%m-%d %H:%M:%S")
+                if self.claude.last_event
+                else "无新增"
+            )
+            snapshot = UsageSnapshot(
+                periods=combined_periods,
+                call_periods=combined_call_periods,
+                updated_at=datetime.now(SHANGHAI),
+                report_time=self.baseline.refreshed_at.astimezone(SHANGHAI),
+                source_status=(
+                    f"Codex 增量事件：{len(self.codex.seen)}，最新 {last_event}",
+                    f"{claude_status}，尾读 {len(self.claude.seen)} 条，最新 {claude_last_event}",
+                    self.cline.status,
+                ),
+            )
+        except Exception as exc:
+            previous = self.get_snapshot()
+            snapshot = UsageSnapshot(
+                periods=previous.periods if previous else {period: {} for period in PERIODS},
+                call_periods=previous.call_periods
+                if previous
+                else {period: {} for period in PERIODS},
+                updated_at=datetime.now(SHANGHAI),
+                report_time=previous.report_time
+                if previous
+                else datetime(1970, 1, 1, tzinfo=SHANGHAI),
+                source_status=previous.source_status if previous else (),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        with self.lock:
+            self.snapshot = snapshot
+        return snapshot
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            self.refresh_once()
+            remaining = REFRESH_SECONDS - (time.monotonic() - started)
+            self.stop_event.wait(max(0.05, remaining))
+
+    def start(self) -> None:
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._run, daemon=True, name="usage-live")
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=1.5)
+
+    def get_snapshot(self) -> UsageSnapshot | None:
+        with self.lock:
+            return self.snapshot
+
+
+class FloatingRankRow:
+    def __init__(self, parent: tk.Widget, rank: int, transparent: str):
+        self.frame = tk.Frame(parent, bg=transparent)
+        self.frame.pack(fill="x", pady=1)
+        self.frame.grid_columnconfigure(4, minsize=122)
+        self.frame.grid_columnconfigure(5, minsize=215, weight=1)
+        medal_colors = ["#FFD166", "#D8E1EF", "#D99B66"]
+        self.rank_label = tk.Label(
+            self.frame,
+            text=str(rank),
+            font=("Cascadia Mono", 10, "bold"),
+            fg=medal_colors[rank - 1],
+            bg=transparent,
+            width=2,
+        )
+        self.rank_label.grid(row=0, column=0, padx=(0, 2), sticky="w")
+        self.platform_canvas = tk.Canvas(
+            self.frame,
+            bg="#4C8DFF",
+            width=74,
+            height=34,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.platform_canvas.grid(row=0, column=1, sticky="w")
+        self.platform_text_id = self.platform_canvas.create_text(
+            37,
+            17,
+            text="平台",
+            font=("Microsoft YaHei UI", 7, "bold"),
+            fill="#FFFFFF",
+            anchor="center",
+        )
+        self.model_canvas = tk.Canvas(
+            self.frame,
+            bg=transparent,
+            width=125,
+            height=44,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.model_canvas.grid(row=0, column=2, sticky="w", padx=(4, 3))
+        self.model_text_id = self.model_canvas.create_text(
+            2,
+            22,
+            text="等待数据",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            fill="#FFFFFF",
+            anchor="w",
+        )
+        self.call_canvas = tk.Canvas(
+            self.frame,
+            width=105,
+            height=44,
+            bg=transparent,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.call_canvas.grid(row=0, column=3, sticky="w", padx=(0, 3))
+        self.call_text_id = self.call_canvas.create_text(
+            2,
+            22,
+            text="0",
+            font=("Cascadia Mono", 9, "bold"),
+            fill="#FFFFFF",
+            anchor="w",
+        )
+        self.delta_canvas = tk.Canvas(
+            self.frame,
+            bg=transparent,
+            width=122,
+            height=44,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.delta_canvas.grid(row=0, column=4, sticky="e", padx=(0, 4))
+        self.delta_text_id = self.delta_canvas.create_text(
+            120,
+            22,
+            text="",
+            font=("Cascadia Mono", 8, "bold"),
+            fill="#20D878",
+            anchor="e",
+        )
+
+        self.token_canvas = tk.Canvas(
+            self.frame,
+            bg=transparent,
+            width=202,
+            height=44,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.token_canvas.grid(row=0, column=5, sticky="e")
+        self.token_text_id = self.token_canvas.create_text(
+            200,
+            22,
+            text="0",
+            font=("Cascadia Mono", 9, "bold"),
+            fill="#FFFFFF",
+            anchor="e",
+        )
+        self.delta_hide_job = None
+        self.call_color_job = None
+        self.call_animation_jobs = []
+        self.call_incoming_text_id = None
+        self.call_value = 0
+        self.call_foreground = "#FFFFFF"
+        self.token_color_job = None
+        self.token_animation_jobs = []
+        self.token_incoming_text_id = None
+        self.token_value = 0
+        self.token_foreground = "#FFFFFF"
+        self.current_key: tuple[str, str] | None = None
+
+    def update(
+        self,
+        key: tuple[str, str] | None,
+        value: int,
+        delta: int,
+        call_value: int,
+        call_delta: int,
+        foreground: str,
+    ) -> None:
+        platform, model = key if key else ("—", "暂无数据")
+        key_changed = key != self.current_key
+        if key_changed and delta <= 0:
+            self._clear_delta()
+        self.current_key = key
+        display_platform = "Claude" if platform == "Claude Code" else platform
+        self.platform_canvas.configure(
+            bg=PLATFORM_COLORS.get(platform, "#8B7CF6")
+        )
+        self.platform_canvas.itemconfigure(
+            self.platform_text_id, text=display_platform
+        )
+        self.model_canvas.itemconfigure(
+            self.model_text_id, text=compact_model_name(model)
+        )
+        if self.token_color_job is None and not self.token_animation_jobs:
+            self.model_canvas.itemconfigure(self.model_text_id, fill=foreground)
+        self._update_token_value(
+            value,
+            animate=not key_changed and delta > 0,
+            foreground=foreground,
+            force=key_changed,
+        )
+        self._update_call_value(
+            call_value,
+            animate=not key_changed and call_delta > 0,
+            foreground=foreground,
+            force=key_changed,
+        )
+        if delta > 0:
+            self._show_delta(delta)
+
+    def _cancel_token_animation(self) -> None:
+        for job in self.token_animation_jobs:
+            try:
+                self.frame.after_cancel(job)
+            except tk.TclError:
+                pass
+        self.token_animation_jobs.clear()
+        if self.token_incoming_text_id is not None:
+            self.token_canvas.delete(self.token_incoming_text_id)
+            self.token_incoming_text_id = None
+        self.token_canvas.coords(self.token_text_id, 200, 22)
+
+    def _update_token_value(
+        self,
+        value: int,
+        animate: bool,
+        foreground: str,
+        force: bool = False,
+    ) -> None:
+        value = int(value)
+        self.token_foreground = foreground
+        if value == self.token_value and not force:
+            return
+        self._cancel_token_animation()
+        if self.token_color_job is not None:
+            self.frame.after_cancel(self.token_color_job)
+            self.token_color_job = None
+        if not animate:
+            self.token_value = value
+            self.token_canvas.itemconfigure(
+                self.token_text_id,
+                text=format_tokens(value),
+                fill=foreground,
+            )
+            self.token_canvas.coords(self.token_text_id, 200, 22)
+            self.model_canvas.itemconfigure(self.model_text_id, fill=foreground)
+            return
+
+        old_text_id = self.token_text_id
+        new_text_id = self.token_canvas.create_text(
+            200,
+            66,
+            text=format_tokens(value),
+            font=("Cascadia Mono", 9, "bold"),
+            fill="#20D878",
+            anchor="e",
+        )
+        self.token_incoming_text_id = new_text_id
+        self.model_canvas.itemconfigure(self.model_text_id, fill="#20D878")
+        steps = 9
+
+        def animate_step(step: int) -> None:
+            progress = step / steps
+            self.token_canvas.coords(old_text_id, 200, 22 - round(44 * progress))
+            self.token_canvas.coords(new_text_id, 200, 66 - round(44 * progress))
+            if step < steps:
+                job = self.frame.after(24, animate_step, step + 1)
+                self.token_animation_jobs.append(job)
+                return
+            self.token_canvas.delete(old_text_id)
+            self.token_text_id = new_text_id
+            self.token_incoming_text_id = None
+            self.token_value = value
+            self.token_animation_jobs.clear()
+            self.token_color_job = self.frame.after(1100, self._restore_token_color)
+
+        animate_step(1)
+
+    def _restore_token_color(self) -> None:
+        self.token_canvas.itemconfigure(self.token_text_id, fill=self.token_foreground)
+        self.model_canvas.itemconfigure(self.model_text_id, fill=self.token_foreground)
+        self.token_color_job = None
+
+    def _cancel_call_animation(self) -> None:
+        for job in self.call_animation_jobs:
+            try:
+                self.frame.after_cancel(job)
+            except tk.TclError:
+                pass
+        self.call_animation_jobs.clear()
+        if self.call_incoming_text_id is not None:
+            self.call_canvas.delete(self.call_incoming_text_id)
+            self.call_incoming_text_id = None
+        self.call_canvas.coords(self.call_text_id, 2, 22)
+
+    def _update_call_value(
+        self,
+        value: int,
+        animate: bool,
+        foreground: str,
+        force: bool = False,
+    ) -> None:
+        value = int(value)
+        self.call_foreground = foreground
+        if value == self.call_value and not force:
+            return
+        self._cancel_call_animation()
+        if self.call_color_job is not None:
+            self.frame.after_cancel(self.call_color_job)
+            self.call_color_job = None
+        if not animate:
+            self.call_value = value
+            self.call_canvas.itemconfigure(
+                self.call_text_id,
+                text=format_tokens(value),
+                fill=foreground,
+            )
+            self.call_canvas.coords(self.call_text_id, 2, 22)
+            return
+
+        old_text_id = self.call_text_id
+        new_text_id = self.call_canvas.create_text(
+            2,
+            66,
+            text=format_tokens(value),
+            font=("Cascadia Mono", 9, "bold"),
+            fill="#20D878",
+            anchor="w",
+        )
+        self.call_incoming_text_id = new_text_id
+        steps = 9
+
+        def animate_step(step: int) -> None:
+            progress = step / steps
+            self.call_canvas.coords(old_text_id, 2, 22 - round(44 * progress))
+            self.call_canvas.coords(new_text_id, 2, 66 - round(44 * progress))
+            if step < steps:
+                job = self.frame.after(24, animate_step, step + 1)
+                self.call_animation_jobs.append(job)
+                return
+            self.call_canvas.delete(old_text_id)
+            self.call_text_id = new_text_id
+            self.call_incoming_text_id = None
+            self.call_value = value
+            self.call_animation_jobs.clear()
+            self.call_color_job = self.frame.after(1100, self._restore_call_color)
+
+        animate_step(1)
+
+    def _restore_call_color(self) -> None:
+        self.call_canvas.itemconfigure(self.call_text_id, fill=self.call_foreground)
+        self.call_color_job = None
+
+    def _show_delta(self, delta: int) -> None:
+        if self.delta_hide_job is not None:
+            self.frame.after_cancel(self.delta_hide_job)
+        self.delta_canvas.itemconfigure(self.delta_text_id, text=f"+{delta:,}")
+        self.delta_hide_job = self.frame.after(1600, self._clear_delta)
+
+    def _clear_delta(self) -> None:
+        self.delta_canvas.itemconfigure(self.delta_text_id, text="")
+        self.delta_hide_job = None
+
+    def set_foreground(self, foreground: str) -> None:
+        self.call_foreground = foreground
+        self.token_foreground = foreground
+        self.rank_label.configure(fg=foreground)
+        if self.token_color_job is None and not self.token_animation_jobs:
+            self.model_canvas.itemconfigure(self.model_text_id, fill=foreground)
+            self.token_canvas.itemconfigure(self.token_text_id, fill=foreground)
+        if self.call_color_job is None and not self.call_animation_jobs:
+            self.call_canvas.itemconfigure(self.call_text_id, fill=foreground)
+
+
+class LiveUsageApp:
+    def __init__(self, engine: UsageEngine, screenshot_path: Path | None = None):
+        self.engine = engine
+        self.period = "cumulative"
+        self.transparent = "#010101"
+        self.foreground = "#FFFFFF"
+        self.drag_origin: tuple[int, int] | None = None
+        self.previous_values = {period: {} for period in PERIODS}
+        self.previous_calls = {period: {} for period in PERIODS}
+        self.period_changed = False
+        self.last_background_check = 0.0
+        self.manual_foreground = False
+        self.root = tk.Tk()
+        self.root.title(APP_TITLE)
+        self.root.overrideredirect(True)
+        self.root.configure(bg=self.transparent)
+        self.root.geometry("710x218")
+        self.root.attributes("-topmost", True)
+        if os.name == "nt":
+            self.root.wm_attributes("-transparentcolor", self.transparent)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.screenshot_path = screenshot_path
+        self._build()
+        self._update_period_styles()
+        self._position_top_right()
+        self.engine.start()
+        self.root.after(100, self._refresh_ui)
+        if screenshot_path:
+            self.root.after(3500, self._save_screenshot)
+
+    def _build(self) -> None:
+        shell = tk.Frame(self.root, bg=self.transparent)
+        shell.pack(fill="both", expand=True, padx=3, pady=3)
+        header = tk.Frame(shell, bg=self.transparent)
+        header.pack(fill="x", pady=(0, 2))
+        self.title_label = tk.Label(
+            header,
+            text="AI TOKEN TOP 3",
+            font=("Cascadia Mono", 10, "bold"),
+            fg=self.foreground,
+            bg=self.transparent,
+        )
+        self.title_label.pack(side="left")
+        self.live_label = tk.Label(
+            header,
+            text="AUTO ●",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            fg="#F6C453",
+            bg=self.transparent,
+        )
+        self.live_label.pack(side="right", padx=(5, 0))
+        self.period_frame = tk.Frame(header, bg=self.transparent)
+        self.period_frame.pack(side="right", padx=(12, 5))
+        self.period_labels = {}
+        for period in PERIODS:
+            label = tk.Label(
+                self.period_frame,
+                text=PERIOD_LABELS[period],
+                font=("Microsoft YaHei UI", 9, "bold"),
+                fg=self.foreground,
+                bg=self.transparent,
+                padx=6,
+                cursor="hand2",
+            )
+            label.pack(side="left")
+            label.bind("<Button-1>", lambda _event, value=period: self._set_period(value))
+            self.period_labels[period] = label
+        self.rows_container = tk.Frame(shell, bg=self.transparent)
+        self.rows_container.pack(fill="x")
+        self.cards = [
+            FloatingRankRow(self.rows_container, rank, self.transparent)
+            for rank in (1, 2, 3)
+        ]
+        self.footer_frame = tk.Frame(shell, bg=self.transparent)
+        self.footer_frame.pack(fill="x", pady=(2, 0))
+        self.color_toggle_label = tk.Label(
+            self.footer_frame,
+            text="白字",
+            font=("Microsoft YaHei UI", 7, "bold"),
+            fg=self.foreground,
+            bg=self.transparent,
+            padx=4,
+            pady=1,
+            borderwidth=1,
+            relief="solid",
+            cursor="hand2",
+        )
+        self.color_toggle_label.pack(side="left")
+        self.color_toggle_label.bind("<Button-1>", self._toggle_foreground)
+        self.color_toggle_label.bind("<Button-3>", self._show_menu)
+        self.footer_label = tk.Label(
+            self.footer_frame,
+            text="0.5s",
+            font=("Cascadia Mono", 7),
+            fg=self.foreground,
+            bg=self.transparent,
+        )
+        self.footer_label.pack(side="right")
+        for widget in (
+            shell,
+            header,
+            self.title_label,
+            self.live_label,
+            self.rows_container,
+            self.footer_frame,
+            self.footer_label,
+        ):
+            self._bind_window_actions(widget)
+        for card in self.cards:
+            for widget in card.frame.winfo_children():
+                self._bind_window_actions(widget)
+        self.menu = tk.Menu(self.root, tearoff=0)
+        for period in PERIODS:
+            self.menu.add_command(
+                label=PERIOD_LABELS[period],
+                command=lambda value=period: self._set_period(value),
+            )
+        self.menu.add_command(label="打开完整报告", command=self._open_report)
+        self.menu.add_separator()
+        self.menu.add_command(label="退出", command=self.close)
+
+    def _bind_window_actions(self, widget: tk.Widget) -> None:
+        widget.bind("<ButtonPress-1>", self._start_drag)
+        widget.bind("<B1-Motion>", self._drag)
+        widget.bind("<Button-3>", self._show_menu)
+
+    def _position_top_right(self) -> None:
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        x = max(0, self.root.winfo_screenwidth() - width - 22)
+        y = 44
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _set_period(self, period: str) -> None:
+        if period == self.period:
+            return
+        self.period = period
+        self.period_changed = True
+        self._update_period_styles()
+
+    def _update_period_styles(self) -> None:
+        for period, label in self.period_labels.items():
+            label.configure(
+                fg="#20D878" if period == self.period else self.foreground,
+                text=f"• {PERIOD_LABELS[period]}" if period == self.period else PERIOD_LABELS[period],
+            )
+
+    def _detect_background_foreground(self) -> str:
+        try:
+            from PIL import ImageGrab, ImageStat
+
+            x = self.root.winfo_rootx()
+            y = self.root.winfo_rooty()
+            width = self.root.winfo_width()
+            height = self.root.winfo_height()
+            image = ImageGrab.grab((x, y, x + width, y + height)).convert("RGB")
+            sample = image.resize((32, 8))
+            luminance = ImageStat.Stat(sample.convert("L")).median[0]
+            if luminance >= 160:
+                return "#111111"
+            if luminance <= 115:
+                return "#FFFFFF"
+            return self.foreground
+        except Exception:
+            return self.foreground
+
+    def _apply_foreground(self, foreground: str) -> None:
+        if foreground == self.foreground:
+            return
+        self.foreground = foreground
+        self.title_label.configure(fg=foreground)
+        self.footer_label.configure(fg=foreground)
+        self.color_toggle_label.configure(
+            text="白字" if foreground == "#FFFFFF" else "黑字",
+            fg=foreground,
+        )
+        for card in self.cards:
+            card.set_foreground(foreground)
+        self._update_period_styles()
+
+    def _toggle_foreground(self, _event=None) -> None:
+        self.manual_foreground = True
+        target = "#111111" if self.foreground == "#FFFFFF" else "#FFFFFF"
+        self._apply_foreground(target)
+
+    def _start_drag(self, event) -> None:
+        self.drag_origin = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
+
+    def _drag(self, event) -> None:
+        if not self.drag_origin:
+            return
+        x = event.x_root - self.drag_origin[0]
+        y = event.y_root - self.drag_origin[1]
+        self.root.geometry(f"+{x}+{y}")
+
+    def _show_menu(self, event) -> None:
+        self.menu.tk_popup(event.x_root, event.y_root)
+
+    def _open_report(self) -> None:
+        path = self.engine.report_dir / "REPORT.html"
+        if path.exists() and os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+
+    def _refresh_ui(self) -> None:
+        snapshot = self.engine.get_snapshot()
+        if snapshot:
+            top = snapshot.top(self.period)
+            previous = self.previous_values[self.period]
+            previous_calls = self.previous_calls[self.period]
+            for index, card in enumerate(self.cards):
+                if index < len(top):
+                    key, value = top[index]
+                    delta = value - previous.get(key, value)
+                    call_value = snapshot.call_periods.get(self.period, {}).get(key, 0)
+                    call_delta = call_value - previous_calls.get(key, call_value)
+                    card.update(
+                        key,
+                        value,
+                        delta,
+                        call_value,
+                        0 if self.period_changed else call_delta,
+                        self.foreground,
+                    )
+                else:
+                    card.update(None, 0, 0, 0, 0, self.foreground)
+            for period in PERIODS:
+                self.previous_values[period] = dict(snapshot.periods.get(period, {}))
+                self.previous_calls[period] = dict(
+                    snapshot.call_periods.get(period, {})
+                )
+            self.period_changed = False
+            top_total = sum(value for _, value in top)
+            source_text = (
+                f"{PERIOD_LABELS[self.period]}前三 Σ {format_tokens(top_total)}  ·  "
+                f"{snapshot.updated_at.strftime('%H:%M:%S.%f')[:-3]}  ·  0.5 秒"
+            )
+            if snapshot.error:
+                self.live_label.configure(text="AUTO ●", fg="#FF667A")
+            else:
+                self.live_label.configure(text="AUTO ●", fg="#36D399")
+            self.footer_label.configure(text=source_text)
+            if (
+                not self.manual_foreground
+                and time.monotonic() - self.last_background_check >= 1.0
+            ):
+                self.last_background_check = time.monotonic()
+                self._apply_foreground(self._detect_background_foreground())
+        self.root.after(500, self._refresh_ui)
+
+    def _save_screenshot(self) -> None:
+        if not self.screenshot_path:
+            return
+        try:
+            from PIL import ImageGrab
+
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+            self.root.focus_force()
+            self.root.update()
+            time.sleep(0.4)
+            x = self.root.winfo_rootx()
+            y = self.root.winfo_rooty()
+            width = self.root.winfo_width()
+            height = self.root.winfo_height()
+            image = ImageGrab.grab((x, y, x + width, y + height))
+            self.screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+            image.save(self.screenshot_path)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        self.engine.stop()
+        self.root.destroy()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+def snapshot_payload(snapshot: UsageSnapshot) -> dict:
+    def rows(period: str):
+        return [
+            {
+                "platform": key[0],
+                "model": key[1],
+                "calls": snapshot.call_periods.get(period, {}).get(key, 0),
+                "total_tokens": value,
+            }
+            for key, value in snapshot.top(period)
+        ]
+
+    return {
+        "updated_at_shanghai": snapshot.updated_at.isoformat(),
+        "report_time_shanghai": snapshot.report_time.isoformat(),
+        "call_counts": {
+            period: snapshot.call_count(period) for period in PERIODS
+        },
+        **{f"top3_{period}": rows(period) for period in PERIODS},
+        "source_status": list(snapshot.source_status),
+        "error": snapshot.error,
+    }
+
+
+def main() -> int:
+    enable_dpi_awareness()
+    parser = argparse.ArgumentParser(description=APP_TITLE)
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--snapshot-json", nargs="?", const="-")
+    parser.add_argument("--screenshot", type=Path)
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        help="Optional directory containing summary.json and report CSV files.",
+    )
+    args = parser.parse_args()
+    engine = UsageEngine(args.report_dir)
+    if args.self_test or args.snapshot_json is not None:
+        snapshot = engine.refresh_once()
+        payload = snapshot_payload(snapshot)
+        output = json.dumps(payload, ensure_ascii=False, indent=2)
+        if args.snapshot_json and args.snapshot_json != "-":
+            Path(args.snapshot_json).write_text(output, encoding="utf-8")
+        elif not getattr(sys, "frozen", False):
+            print(output)
+        return 0 if not snapshot.error and len(snapshot.top("cumulative")) == 3 else 1
+    instance_mutex = acquire_single_instance_mutex()
+    if instance_mutex is None:
+        return 0
+    try:
+        LiveUsageApp(engine, screenshot_path=args.screenshot).run()
+    finally:
+        release_single_instance_mutex(instance_mutex)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
