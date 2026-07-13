@@ -6,6 +6,7 @@ __pycache__/
 venv/
 build/
 dist/
+TokenWatcher.runtime/
 outputs/
 *.exe
 *.log

@@ -10,6 +10,8 @@ TokenWatcher is a lightweight Windows desktop overlay that displays the three mo
 - Event-driven log discovery, incremental tailing, and cached summary/task files
 - Codex cumulative-snapshot deduplication across continued or forked tasks
 - Persistent Codex fingerprint/offset cache for fast restarts
+- Immediate startup display from the last verified aggregate snapshot; live sources
+  reconcile it in the background
 - Green rolling animation when a value increases
 - Transparent, always-on-top, draggable window
 - Automatic black/white text selection based on the desktop background
@@ -58,7 +60,10 @@ python -m pip install -r requirements-dev.txt
 powershell -ExecutionPolicy Bypass -File scripts/build.ps1
 ```
 
-The single-file executable is written to `TokenWatcher.exe`.
+The fast-start package is written to `TokenWatcher.exe` plus the adjacent
+`TokenWatcher.runtime` directory. Keep them together when moving or distributing
+the app. The small root executable launches the reusable runtime without unpacking
+the Python application again on every start.
 
 ## Diagnostics
 

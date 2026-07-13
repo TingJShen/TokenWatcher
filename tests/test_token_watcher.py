@@ -100,6 +100,97 @@ class TokenWatcherTests(unittest.TestCase):
             self.assertEqual(baseline.report_mtime, 0.0)
             self.assertFalse(baseline.periods["cumulative"])
 
+    def test_usage_snapshot_cache_is_loaded_before_background_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cache_path = root / "usage_snapshot_cache.json"
+            now = datetime.now(timezone.utc)
+            periods = {period: {} for period in token_watcher.PERIODS}
+            call_periods = {period: {} for period in token_watcher.PERIODS}
+            periods["cumulative"][("Codex", "gpt-test")] = 123
+            call_periods["cumulative"][("Codex", "gpt-test")] = 4
+            snapshot = token_watcher.UsageSnapshot(
+                periods=periods,
+                call_periods=call_periods,
+                updated_at=now,
+                report_time=now,
+                source_status=("cached",),
+            )
+            writer = token_watcher.UsageEngine(
+                report_dir=root,
+                snapshot_cache_path=cache_path,
+            )
+            writer.snapshot = snapshot
+            writer.stop()
+
+            reader = token_watcher.UsageEngine(
+                report_dir=root,
+                snapshot_cache_path=cache_path,
+            )
+            loaded = reader.get_snapshot()
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(
+                loaded.periods["cumulative"][("Codex", "gpt-test")],
+                123,
+            )
+            self.assertEqual(
+                loaded.call_periods["cumulative"][("Codex", "gpt-test")],
+                4,
+            )
+
+    def test_usage_snapshot_cache_does_not_rewrite_unchanged_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cache_path = root / "usage_snapshot_cache.json"
+            now = datetime.now(timezone.utc)
+            snapshot = token_watcher.UsageSnapshot(
+                periods={period: {} for period in token_watcher.PERIODS},
+                call_periods={period: {} for period in token_watcher.PERIODS},
+                updated_at=now,
+                report_time=now,
+                source_status=(),
+            )
+            first = token_watcher.UsageEngine(
+                report_dir=root,
+                snapshot_cache_path=cache_path,
+            )
+            first.snapshot = snapshot
+            first.stop()
+
+            second = token_watcher.UsageEngine(
+                report_dir=root,
+                snapshot_cache_path=cache_path,
+            )
+            with patch.object(token_watcher.os, "replace") as replace:
+                second.stop()
+            replace.assert_not_called()
+
+    def test_background_loop_saves_snapshot_only_after_first_refresh(self) -> None:
+        class StopAfterThreeWaits:
+            def __init__(self) -> None:
+                self.waits = 0
+
+            def is_set(self) -> bool:
+                return self.waits >= 3
+
+            def wait(self, _timeout: float) -> bool:
+                self.waits += 1
+                return False
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            engine = token_watcher.UsageEngine(
+                report_dir=root,
+                snapshot_cache_path=root / "usage_snapshot_cache.json",
+            )
+            engine.stop_event = StopAfterThreeWaits()
+            with patch.object(engine, "refresh_once"), patch.object(
+                engine, "_save_snapshot_cache"
+            ) as save:
+                engine._run()
+            self.assertEqual(save.call_count, 1)
+
     def test_codex_cold_files_are_not_polled_and_changes_are_event_driven(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             home = Path(temporary_directory)

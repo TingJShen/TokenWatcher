@@ -24,4 +24,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: TokenWatcher-windows
-          path: TokenWatcher.exe
+          path: |
+            TokenWatcher.exe
+            TokenWatcher.runtime/**

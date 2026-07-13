@@ -56,6 +56,7 @@ CODEX_USAGE_KEYS = (
     "total_tokens",
 )
 CODEX_CACHE_VERSION = 1
+USAGE_SNAPSHOT_CACHE_VERSION = 1
 
 
 def codex_usage_fingerprint(
@@ -1178,12 +1179,84 @@ class UsageSnapshot:
         return sum(self.call_periods.get(period, {}).values())
 
 
+def usage_snapshot_signature(snapshot: UsageSnapshot) -> tuple:
+    def normalized(values: dict[str, dict[tuple[str, str], int]]) -> tuple:
+        return tuple(
+            (
+                period,
+                tuple(
+                    sorted(
+                        (platform, model, int(value))
+                        for (platform, model), value in values.get(period, {}).items()
+                    )
+                ),
+            )
+            for period in PERIODS
+        )
+
+    return (
+        normalized(snapshot.periods),
+        normalized(snapshot.call_periods),
+        snapshot.report_time.isoformat(),
+    )
+
+
+def usage_snapshot_to_json(snapshot: UsageSnapshot) -> dict:
+    def encode(values: dict[str, dict[tuple[str, str], int]]) -> dict[str, list[dict]]:
+        return {
+            period: [
+                {
+                    "platform": platform,
+                    "model": model,
+                    "value": int(value),
+                }
+                for (platform, model), value in sorted(values.get(period, {}).items())
+            ]
+            for period in PERIODS
+        }
+
+    return {
+        "periods": encode(snapshot.periods),
+        "call_periods": encode(snapshot.call_periods),
+        "updated_at": snapshot.updated_at.isoformat(),
+        "report_time": snapshot.report_time.isoformat(),
+        "source_status": list(snapshot.source_status),
+    }
+
+
+def usage_snapshot_from_json(payload: dict) -> UsageSnapshot:
+    def decode(name: str) -> dict[str, dict[tuple[str, str], int]]:
+        decoded = {period: {} for period in PERIODS}
+        source = payload.get(name) or {}
+        for period in PERIODS:
+            for row in source.get(period) or []:
+                key = (str(row["platform"]), str(row["model"]))
+                decoded[period][key] = int(row["value"])
+        return decoded
+
+    return UsageSnapshot(
+        periods=decode("periods"),
+        call_periods=decode("call_periods"),
+        updated_at=parse_time(payload.get("updated_at")),
+        report_time=parse_time(payload.get("report_time")),
+        source_status=tuple(str(value) for value in payload.get("source_status") or ()),
+    )
+
+
 class UsageEngine:
-    def __init__(self, report_dir: Path | None = None):
+    def __init__(
+        self,
+        report_dir: Path | None = None,
+        snapshot_cache_path: Path | None = None,
+    ):
         self.report_dir = report_dir or find_report_dir()
+        self.snapshot_cache_path = snapshot_cache_path or (
+            Path.home() / ".tokenwatcher" / "usage_snapshot_cache.json"
+        )
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.snapshot: UsageSnapshot | None = None
+        self.snapshot_cache_signature: tuple | None = None
         self.thread: threading.Thread | None = None
         self.baseline: Baseline | None = None
         self.codex: CodexTailTracker | None = None
@@ -1192,6 +1265,47 @@ class UsageEngine:
         self.claude_usage = ClaudeUsageCache()
         self.claude_boundary: datetime | None = None
         self.cline: ClinePoller | None = None
+        self._load_snapshot_cache()
+
+    def _load_snapshot_cache(self) -> None:
+        try:
+            payload = json.loads(self.snapshot_cache_path.read_text(encoding="utf-8"))
+            if int(payload.get("version") or 0) != USAGE_SNAPSHOT_CACHE_VERSION:
+                return
+            snapshot = usage_snapshot_from_json(payload["snapshot"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return
+        self.snapshot = snapshot
+        self.snapshot_cache_signature = usage_snapshot_signature(snapshot)
+
+    def _save_snapshot_cache(self) -> None:
+        snapshot = self.get_snapshot()
+        if snapshot is None or snapshot.error:
+            return
+        signature = usage_snapshot_signature(snapshot)
+        if signature == self.snapshot_cache_signature:
+            return
+        payload = {
+            "version": USAGE_SNAPSHOT_CACHE_VERSION,
+            "saved_at": datetime.now(SHANGHAI).isoformat(),
+            "snapshot": usage_snapshot_to_json(snapshot),
+        }
+        temporary_path = self.snapshot_cache_path.with_name(
+            f"{self.snapshot_cache_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            self.snapshot_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(temporary_path, self.snapshot_cache_path)
+            self.snapshot_cache_signature = signature
+        except OSError:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _close_trackers(self) -> None:
         if self.codex is not None:
@@ -1295,9 +1409,13 @@ class UsageEngine:
         return snapshot
 
     def _run(self) -> None:
+        initial_cache_saved = False
         while not self.stop_event.is_set():
             started = time.monotonic()
             self.refresh_once()
+            if not initial_cache_saved:
+                self._save_snapshot_cache()
+                initial_cache_saved = True
             remaining = REFRESH_SECONDS - (time.monotonic() - started)
             self.stop_event.wait(max(0.05, remaining))
 
@@ -1311,6 +1429,7 @@ class UsageEngine:
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=1.5)
+        self._save_snapshot_cache()
         self._close_trackers()
 
     def get_snapshot(self) -> UsageSnapshot | None:
@@ -1663,6 +1782,10 @@ class LiveUsageApp:
         self._build()
         self._update_period_styles()
         self._position_top_right()
+        if self.engine.get_snapshot() is not None:
+            self.manual_foreground = True
+            self._refresh_ui(schedule=False)
+            self.manual_foreground = False
         self.engine.start()
         self.root.after(100, self._refresh_ui)
         if screenshot_path:
@@ -1842,7 +1965,7 @@ class LiveUsageApp:
         if path.exists() and os.name == "nt":
             os.startfile(path)  # type: ignore[attr-defined]
 
-    def _refresh_ui(self) -> None:
+    def _refresh_ui(self, schedule: bool = True) -> None:
         snapshot = self.engine.get_snapshot()
         if snapshot:
             top = snapshot.top(self.period)
@@ -1886,7 +2009,8 @@ class LiveUsageApp:
             ):
                 self.last_background_check = time.monotonic()
                 self._apply_foreground(self._detect_background_foreground())
-        self.root.after(500, self._refresh_ui)
+        if schedule:
+            self.root.after(500, self._refresh_ui)
 
     def _save_screenshot(self) -> None:
         if not self.screenshot_path:
@@ -1956,14 +2080,17 @@ def main() -> int:
     args = parser.parse_args()
     engine = UsageEngine(args.report_dir)
     if args.self_test or args.snapshot_json is not None:
-        snapshot = engine.refresh_once()
-        payload = snapshot_payload(snapshot)
-        output = json.dumps(payload, ensure_ascii=False, indent=2)
-        if args.snapshot_json and args.snapshot_json != "-":
-            Path(args.snapshot_json).write_text(output, encoding="utf-8")
-        elif not getattr(sys, "frozen", False):
-            print(output)
-        return 0 if not snapshot.error and len(snapshot.top("cumulative")) == 3 else 1
+        try:
+            snapshot = engine.refresh_once()
+            payload = snapshot_payload(snapshot)
+            output = json.dumps(payload, ensure_ascii=False, indent=2)
+            if args.snapshot_json and args.snapshot_json != "-":
+                Path(args.snapshot_json).write_text(output, encoding="utf-8")
+            elif not getattr(sys, "frozen", False):
+                print(output)
+            return 0 if not snapshot.error and len(snapshot.top("cumulative")) == 3 else 1
+        finally:
+            engine.stop()
     instance_mutex = acquire_single_instance_mutex()
     if instance_mutex is None:
         return 0
