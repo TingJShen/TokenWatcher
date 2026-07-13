@@ -19,8 +19,7 @@ INSTANCE_MUTEX_NAME = "Local\\TokenWatcher.Singleton"
 START_DATE = date(2026, 2, 1)
 REFRESH_SECONDS = 0.5
 DISCOVERY_SECONDS = 10.0
-HOT_FILE_SECONDS = 120.0
-COLD_FILE_CHECK_SECONDS = 10.0
+STARTUP_HOT_SECONDS = 300.0
 SHANGHAI = timezone(timedelta(hours=8))
 PERIODS = ("today", "week", "month", "cumulative")
 PERIOD_LABELS = {
@@ -233,7 +232,8 @@ class CodexFileState:
     last_mtime: float = 0.0
     last_size: int = 0
     next_check: float = 0.0
-    hot_until: float = 0.0
+    watching: bool = True
+    stop_after_initial: bool = False
 
 
 class CodexTailTracker:
@@ -272,7 +272,11 @@ class CodexTailTracker:
         for path in self._paths():
             if path in self.states:
                 continue
-            state = CodexFileState()
+            try:
+                startup_cold = force and path.stat().st_mtime < time.time() - STARTUP_HOT_SECONDS
+            except OSError:
+                startup_cold = False
+            state = CodexFileState(stop_after_initial=startup_cold)
             self.states[path] = state
             self._read_path(path, state, initial=True)
 
@@ -347,6 +351,8 @@ class CodexTailTracker:
         now: float | None = None,
     ) -> None:
         now = time.monotonic() if now is None else now
+        if not initial and not state.watching:
+            return
         if not initial and now < state.next_check:
             return
         try:
@@ -360,18 +366,21 @@ class CodexTailTracker:
             state.last_size = size
             state.last_mtime = mtime
             if size == state.offset:
-                interval = REFRESH_SECONDS if now < state.hot_until else COLD_FILE_CHECK_SECONDS
-                state.next_check = now + interval
+                if initial:
+                    state.watching = False
+                else:
+                    state.next_check = now + REFRESH_SECONDS
                 return
             with path.open("rb") as handle:
                 handle.seek(state.offset)
                 data = handle.read()
             state.offset = size
-            state.hot_until = now + HOT_FILE_SECONDS
             state.next_check = now + REFRESH_SECONDS
             self._consume(data, state, initial)
+            if initial and state.stop_after_initial:
+                state.watching = False
             if not changed:
-                state.next_check = now + COLD_FILE_CHECK_SECONDS
+                state.watching = False
         except OSError:
             self.errors += 1
 
@@ -447,7 +456,8 @@ class ClaudeFileState:
     last_mtime: float = 0.0
     last_size: int = 0
     next_check: float = 0.0
-    hot_until: float = 0.0
+    watching: bool = True
+    stop_after_initial: bool = False
 
 
 class ClaudeTailTracker:
@@ -474,13 +484,15 @@ class ClaudeTailTracker:
         threshold = self.since.timestamp() - 5
         for path in self.root.rglob("*.jsonl"):
             try:
-                if path.stat().st_mtime < threshold or path in self.states:
+                stat = path.stat()
+                if stat.st_mtime < threshold or path in self.states:
                     continue
             except OSError:
                 continue
-            state = ClaudeFileState()
+            startup_cold = force and stat.st_mtime < time.time() - STARTUP_HOT_SECONDS
+            state = ClaudeFileState(stop_after_initial=startup_cold)
             self.states[path] = state
-            self._read_path(path, state)
+            self._read_path(path, state, initial=True)
 
     def _consume(self, data: bytes, state: ClaudeFileState) -> None:
         data = state.remainder + data
@@ -530,9 +542,12 @@ class ClaudeTailTracker:
         self,
         path: Path,
         state: ClaudeFileState,
+        initial: bool = False,
         now: float | None = None,
     ) -> None:
         now = time.monotonic() if now is None else now
+        if not initial and not state.watching:
+            return
         if now < state.next_check:
             return
         try:
@@ -546,18 +561,21 @@ class ClaudeTailTracker:
             state.last_size = size
             state.last_mtime = mtime
             if size == state.offset:
-                interval = REFRESH_SECONDS if now < state.hot_until else COLD_FILE_CHECK_SECONDS
-                state.next_check = now + interval
+                if initial:
+                    state.watching = False
+                else:
+                    state.next_check = now + REFRESH_SECONDS
                 return
             with path.open("rb") as handle:
                 handle.seek(state.offset)
                 data = handle.read()
             state.offset = size
-            state.hot_until = now + HOT_FILE_SECONDS
             state.next_check = now + REFRESH_SECONDS
             self._consume(data, state)
+            if initial and state.stop_after_initial:
+                state.watching = False
             if not changed:
-                state.next_check = now + COLD_FILE_CHECK_SECONDS
+                state.watching = False
         except OSError:
             self.errors += 1
 
