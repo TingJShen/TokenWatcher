@@ -100,6 +100,22 @@ class TokenWatcherTests(unittest.TestCase):
             self.assertEqual(baseline.report_mtime, 0.0)
             self.assertFalse(baseline.periods["cumulative"])
 
+    def test_report_lookup_walks_up_from_directory_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            runtime = root / "TokenWatcher" / "TokenWatcher.runtime"
+            runtime.mkdir(parents=True)
+            report_dir = root / "outputs" / token_watcher.REPORT_FOLDER_NAME
+            report_dir.mkdir(parents=True)
+            (report_dir / "model_total.csv").write_text(
+                "platform,model,total_tokens\nCodex,gpt-test,1\n",
+                encoding="utf-8",
+            )
+            with patch.object(token_watcher.sys, "frozen", True, create=True), patch.object(
+                token_watcher.sys, "executable", str(runtime / "TokenWatcher.exe")
+            ), patch.object(token_watcher.Path, "cwd", return_value=runtime):
+                self.assertEqual(token_watcher.find_report_dir(), report_dir)
+
     def test_usage_snapshot_cache_is_loaded_before_background_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -165,6 +181,35 @@ class TokenWatcherTests(unittest.TestCase):
             with patch.object(token_watcher.os, "replace") as replace:
                 second.stop()
             replace.assert_not_called()
+
+    def test_usage_snapshot_cache_is_scoped_to_report_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            first_report = root / "first"
+            second_report = root / "second"
+            first_report.mkdir()
+            second_report.mkdir()
+            cache_path = root / "usage_snapshot_cache.json"
+            now = datetime.now(timezone.utc)
+            snapshot = token_watcher.UsageSnapshot(
+                periods={period: {} for period in token_watcher.PERIODS},
+                call_periods={period: {} for period in token_watcher.PERIODS},
+                updated_at=now,
+                report_time=now,
+                source_status=(),
+            )
+            writer = token_watcher.UsageEngine(
+                report_dir=first_report,
+                snapshot_cache_path=cache_path,
+            )
+            writer.snapshot = snapshot
+            writer.stop()
+
+            reader = token_watcher.UsageEngine(
+                report_dir=second_report,
+                snapshot_cache_path=cache_path,
+            )
+            self.assertIsNone(reader.get_snapshot())
 
     def test_background_loop_saves_snapshot_only_after_first_refresh(self) -> None:
         class StopAfterThreeWaits:

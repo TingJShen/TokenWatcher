@@ -56,7 +56,7 @@ CODEX_USAGE_KEYS = (
     "total_tokens",
 )
 CODEX_CACHE_VERSION = 1
-USAGE_SNAPSHOT_CACHE_VERSION = 1
+USAGE_SNAPSHOT_CACHE_VERSION = 2
 
 
 def codex_usage_fingerprint(
@@ -332,23 +332,21 @@ def add_period_usage(
 def find_report_dir() -> Path:
     configured = os.environ.get("AI_USAGE_REPORT_DIR")
     candidates = [Path(configured).expanduser()] if configured else []
+
+    def add_ancestor_candidates(root: Path) -> None:
+        for directory in (root, *tuple(root.parents)[:3]):
+            candidate = directory / "outputs" / REPORT_FOLDER_NAME
+            if candidate not in candidates:
+                candidates.append(candidate)
+
     if getattr(sys, "frozen", False):
         executable_root = Path(sys.executable).resolve().parent
-        candidates.extend(
-            [
-                executable_root / "outputs" / REPORT_FOLDER_NAME,
-                executable_root.parent / "outputs" / REPORT_FOLDER_NAME,
-            ]
-        )
+        add_ancestor_candidates(executable_root)
     else:
         root = Path(__file__).resolve().parents[1]
-        candidates.append(root / "outputs" / REPORT_FOLDER_NAME)
-    candidates.extend(
-        [
-            Path.cwd() / "outputs" / REPORT_FOLDER_NAME,
-            Path.home() / ".tokenwatcher" / REPORT_FOLDER_NAME,
-        ]
-    )
+        add_ancestor_candidates(root)
+    add_ancestor_candidates(Path.cwd().resolve())
+    candidates.append(Path.home() / ".tokenwatcher" / REPORT_FOLDER_NAME)
     for candidate in candidates:
         if (candidate / "model_total.csv").exists():
             return candidate
@@ -1272,6 +1270,9 @@ class UsageEngine:
             payload = json.loads(self.snapshot_cache_path.read_text(encoding="utf-8"))
             if int(payload.get("version") or 0) != USAGE_SNAPSHOT_CACHE_VERSION:
                 return
+            cached_report_dir = Path(str(payload["report_dir"])).resolve()
+            if cached_report_dir != self.report_dir.resolve():
+                return
             snapshot = usage_snapshot_from_json(payload["snapshot"])
         except (OSError, ValueError, TypeError, KeyError):
             return
@@ -1288,6 +1289,7 @@ class UsageEngine:
         payload = {
             "version": USAGE_SNAPSHOT_CACHE_VERSION,
             "saved_at": datetime.now(SHANGHAI).isoformat(),
+            "report_dir": str(self.report_dir.resolve()),
             "snapshot": usage_snapshot_to_json(snapshot),
         }
         temporary_path = self.snapshot_cache_path.with_name(
