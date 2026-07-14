@@ -60,6 +60,42 @@ CLAUDE_CACHE_VERSION = 1
 USAGE_SNAPSHOT_CACHE_VERSION = 2
 
 
+def _percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = round((len(ordered) - 1) * fraction)
+    return ordered[index]
+
+
+def _relative_luminance(pixel: tuple[int, int, int]) -> float:
+    channels = []
+    for value in pixel:
+        normalized = value / 255.0
+        channels.append(
+            normalized / 12.92
+            if normalized <= 0.04045
+            else ((normalized + 0.055) / 1.055) ** 2.4
+        )
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def choose_text_foreground(
+    pixels: list[tuple[int, int, int]],
+    previous_foreground: str = "#FFFFFF",
+) -> str:
+    if not pixels:
+        return previous_foreground
+    luminances = [_relative_luminance(pixel) for pixel in pixels]
+    black_contrasts = [(value + 0.05) / 0.05 for value in luminances]
+    white_contrasts = [1.05 / (value + 0.05) for value in luminances]
+    black_score = _percentile(black_contrasts, 0.2)
+    white_score = _percentile(white_contrasts, 0.2)
+    if abs(black_score - white_score) < 0.15:
+        return previous_foreground
+    return "#111111" if black_score > white_score else "#FFFFFF"
+
+
 def codex_usage_fingerprint(
     session_id: str,
     event_timestamp: object,
@@ -1732,6 +1768,7 @@ class FloatingRankRow:
         self.call_incoming_text_id = None
         self.call_value = 0
         self.call_foreground = "#FFFFFF"
+        self.model_foreground = "#FFFFFF"
         self.token_color_job = None
         self.token_animation_jobs = []
         self.token_incoming_text_id = None
@@ -1746,7 +1783,6 @@ class FloatingRankRow:
         delta: int,
         call_value: int,
         call_delta: int,
-        foreground: str,
     ) -> None:
         platform, model = key if key else ("—", "暂无数据")
         key_changed = key != self.current_key
@@ -1764,17 +1800,19 @@ class FloatingRankRow:
             self.model_text_id, text=compact_model_name(model)
         )
         if self.token_color_job is None and not self.token_animation_jobs:
-            self.model_canvas.itemconfigure(self.model_text_id, fill=foreground)
+            self.model_canvas.itemconfigure(
+                self.model_text_id, fill=self.model_foreground
+            )
         self._update_token_value(
             value,
             animate=not key_changed and delta > 0,
-            foreground=foreground,
+            foreground=self.token_foreground,
             force=key_changed,
         )
         self._update_call_value(
             call_value,
             animate=not key_changed and call_delta > 0,
-            foreground=foreground,
+            foreground=self.call_foreground,
             force=key_changed,
         )
         if delta > 0:
@@ -1850,7 +1888,9 @@ class FloatingRankRow:
 
     def _restore_token_color(self) -> None:
         self.token_canvas.itemconfigure(self.token_text_id, fill=self.token_foreground)
-        self.model_canvas.itemconfigure(self.model_text_id, fill=self.token_foreground)
+        self.model_canvas.itemconfigure(
+            self.model_text_id, fill=self.model_foreground
+        )
         self.token_color_job = None
 
     def _cancel_call_animation(self) -> None:
@@ -1926,7 +1966,11 @@ class FloatingRankRow:
     def _show_delta(self, delta: int) -> None:
         if self.delta_hide_job is not None:
             self.frame.after_cancel(self.delta_hide_job)
-        self.delta_canvas.itemconfigure(self.delta_text_id, text=f"+{delta:,}")
+        self.delta_canvas.itemconfigure(
+            self.delta_text_id,
+            text=f"+{delta:,}",
+            fill="#20D878",
+        )
         self.delta_hide_job = self.frame.after(1600, self._clear_delta)
 
     def _clear_delta(self) -> None:
@@ -1934,15 +1978,30 @@ class FloatingRankRow:
         self.delta_hide_job = None
 
     def set_foreground(self, foreground: str) -> None:
-        self.call_foreground = foreground
-        self.token_foreground = foreground
-        self.rank_label.configure(fg=foreground)
-        if self.token_color_job is None and not self.token_animation_jobs:
-            self.model_canvas.itemconfigure(self.model_text_id, fill=foreground)
-            self.token_canvas.itemconfigure(self.token_text_id, fill=foreground)
-        if self.call_color_job is None and not self.call_animation_jobs:
-            self.call_canvas.itemconfigure(self.call_text_id, fill=foreground)
+        self.set_foregrounds(
+            foreground,
+            foreground,
+            foreground,
+            foreground,
+        )
 
+    def set_foregrounds(
+        self,
+        rank: str,
+        model: str,
+        call: str,
+        token: str,
+    ) -> None:
+        self.model_foreground = model
+        self.call_foreground = call
+        self.token_foreground = token
+        self.rank_label.configure(fg=rank)
+        if self.token_color_job is None and not self.token_animation_jobs:
+            self.model_canvas.itemconfigure(self.model_text_id, fill=model)
+            self.token_canvas.itemconfigure(self.token_text_id, fill=token)
+        if self.call_color_job is None and not self.call_animation_jobs:
+            self.call_canvas.itemconfigure(self.call_text_id, fill=call)
+        self.delta_canvas.itemconfigure(self.delta_text_id, fill="#20D878")
 
 class LiveUsageApp:
     def __init__(self, engine: UsageEngine, screenshot_path: Path | None = None):
@@ -1950,6 +2009,7 @@ class LiveUsageApp:
         self.period = "cumulative"
         self.transparent = "#010101"
         self.foreground = "#FFFFFF"
+        self.live_foreground = "#FFFFFF"
         self.drag_origin: tuple[int, int] | None = None
         self.previous_values = {period: {} for period in PERIODS}
         self.previous_calls = {period: {} for period in PERIODS}
@@ -1974,6 +2034,8 @@ class LiveUsageApp:
             self._refresh_ui(schedule=False)
             self.manual_foreground = False
         self._position_top_right()
+        self.root.update_idletasks()
+        self._apply_adaptive_foregrounds()
         self.root.deiconify()
         self.root.lift()
         self.engine.start()
@@ -1982,9 +2044,10 @@ class LiveUsageApp:
             self.root.after(3500, self._save_screenshot)
 
     def _build(self) -> None:
-        shell = tk.Frame(self.root, bg=self.transparent)
-        shell.pack(fill="both", expand=True, padx=3, pady=3)
-        header = tk.Frame(shell, bg=self.transparent)
+        self.shell = tk.Frame(self.root, bg=self.transparent)
+        self.shell.pack(fill="both", expand=True, padx=3, pady=3)
+        self.header = tk.Frame(self.shell, bg=self.transparent)
+        header = self.header
         header.pack(fill="x", pady=(0, 2))
         self.title_label = tk.Label(
             header,
@@ -2018,13 +2081,13 @@ class LiveUsageApp:
             label.pack(side="left")
             label.bind("<Button-1>", lambda _event, value=period: self._set_period(value))
             self.period_labels[period] = label
-        self.rows_container = tk.Frame(shell, bg=self.transparent)
+        self.rows_container = tk.Frame(self.shell, bg=self.transparent)
         self.rows_container.pack(fill="x")
         self.cards = [
             FloatingRankRow(self.rows_container, rank, self.transparent)
             for rank in (1, 2, 3)
         ]
-        self.footer_frame = tk.Frame(shell, bg=self.transparent)
+        self.footer_frame = tk.Frame(self.shell, bg=self.transparent)
         self.footer_frame.pack(fill="x", pady=(2, 0))
         self.color_toggle_label = tk.Label(
             self.footer_frame,
@@ -2050,8 +2113,8 @@ class LiveUsageApp:
         )
         self.footer_label.pack(side="right")
         for widget in (
-            shell,
-            header,
+            self.shell,
+            self.header,
             self.title_label,
             self.live_label,
             self.rows_container,
@@ -2095,47 +2158,98 @@ class LiveUsageApp:
     def _update_period_styles(self) -> None:
         for period, label in self.period_labels.items():
             label.configure(
-                fg="#20D878" if period == self.period else self.foreground,
                 text=f"• {PERIOD_LABELS[period]}" if period == self.period else PERIOD_LABELS[period],
             )
 
-    def _detect_background_foreground(self) -> str:
+    def _capture_background(self):
         try:
-            from PIL import ImageGrab, ImageStat
+            from PIL import ImageGrab
 
             x = self.root.winfo_rootx()
             y = self.root.winfo_rooty()
             width = self.root.winfo_width()
             height = self.root.winfo_height()
-            image = ImageGrab.grab((x, y, x + width, y + height)).convert("RGB")
-            sample = image.resize((32, 8))
-            luminance = ImageStat.Stat(sample.convert("L")).median[0]
-            if luminance >= 160:
-                return "#111111"
-            if luminance <= 115:
-                return "#FFFFFF"
-            return self.foreground
+            return ImageGrab.grab(
+                (x, y, x + width, y + height),
+                all_screens=True,
+            ).convert("RGB")
         except Exception:
-            return self.foreground
+            return None
 
-    def _apply_foreground(self, foreground: str) -> None:
-        if foreground == self.foreground:
+    def _widget_foreground(self, image, widget: tk.Widget, previous: str) -> str:
+        x = widget.winfo_rootx() - self.root.winfo_rootx()
+        y = widget.winfo_rooty() - self.root.winfo_rooty()
+        width = widget.winfo_width()
+        height = widget.winfo_height()
+        if width <= 0 or height <= 0:
+            return previous
+        crop = image.crop((x, y, x + width, y + height)).resize((12, 4))
+        return choose_text_foreground(list(crop.getdata()), previous)
+
+    def _apply_adaptive_foregrounds(self) -> None:
+        image = self._capture_background()
+        if image is None:
             return
-        self.foreground = foreground
-        self.title_label.configure(fg=foreground)
-        self.footer_label.configure(fg=foreground)
-        self.color_toggle_label.configure(
-            text="白字" if foreground == "#FFFFFF" else "黑字",
-            fg=foreground,
+        self.foreground = self._widget_foreground(
+            image, self.title_label, self.foreground
         )
+        self.title_label.configure(fg=self.foreground)
+        for label in self.period_labels.values():
+            foreground = self._widget_foreground(
+                image, label, str(label.cget("fg"))
+            )
+            label.configure(fg=foreground)
         for card in self.cards:
-            card.set_foreground(foreground)
-        self._update_period_styles()
+            card.set_foregrounds(
+                self._widget_foreground(
+                    image, card.rank_label, str(card.rank_label.cget("fg"))
+                ),
+                self._widget_foreground(
+                    image, card.model_canvas, card.model_foreground
+                ),
+                self._widget_foreground(
+                    image, card.call_canvas, card.call_foreground
+                ),
+                self._widget_foreground(
+                    image, card.token_canvas, card.token_foreground
+                ),
+            )
+        self.footer_label.configure(
+            fg=self._widget_foreground(
+                image, self.footer_label, str(self.footer_label.cget("fg"))
+            )
+        )
+        self.color_toggle_label.configure(
+            text="自动",
+            fg=self._widget_foreground(
+                image,
+                self.color_toggle_label,
+                str(self.color_toggle_label.cget("fg")),
+            ),
+        )
+        self.live_foreground = self._widget_foreground(
+            image, self.live_label, self.live_foreground
+        )
+        self.live_label.configure(fg=self.live_foreground)
+        self.root.deiconify()
+        self.root.lift()
 
     def _toggle_foreground(self, _event=None) -> None:
-        self.manual_foreground = True
-        target = "#111111" if self.foreground == "#FFFFFF" else "#FFFFFF"
-        self._apply_foreground(target)
+        self.manual_foreground = not self.manual_foreground
+        if self.manual_foreground:
+            target = "#111111" if self.foreground == "#FFFFFF" else "#FFFFFF"
+            self.foreground = target
+            self.title_label.configure(fg=target)
+            self.footer_label.configure(fg=target)
+            for label in self.period_labels.values():
+                label.configure(fg=target)
+            for card in self.cards:
+                card.set_foreground(target)
+            self.color_toggle_label.configure(
+                text="手动白" if target == "#FFFFFF" else "手动黑", fg=target
+            )
+        else:
+            self._apply_adaptive_foregrounds()
 
     def _start_drag(self, event) -> None:
         self.drag_origin = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
@@ -2173,10 +2287,9 @@ class LiveUsageApp:
                         delta,
                         call_value,
                         0 if self.period_changed else call_delta,
-                        self.foreground,
                     )
                 else:
-                    card.update(None, 0, 0, 0, 0, self.foreground)
+                    card.update(None, 0, 0, 0, 0)
             for period in PERIODS:
                 self.previous_values[period] = dict(snapshot.periods.get(period, {}))
                 self.previous_calls[period] = dict(
@@ -2189,16 +2302,16 @@ class LiveUsageApp:
                 f"{snapshot.updated_at.strftime('%H:%M:%S.%f')[:-3]}  ·  0.5 秒"
             )
             if snapshot.error:
-                self.live_label.configure(text="AUTO ●", fg="#FF667A")
+                self.live_label.configure(text="AUTO ×", fg=self.live_foreground)
             else:
-                self.live_label.configure(text="AUTO ●", fg="#36D399")
+                self.live_label.configure(text="AUTO ●", fg=self.live_foreground)
             self.footer_label.configure(text=source_text)
             if (
                 not self.manual_foreground
                 and time.monotonic() - self.last_background_check >= 1.0
             ):
                 self.last_background_check = time.monotonic()
-                self._apply_foreground(self._detect_background_foreground())
+                self._apply_adaptive_foregrounds()
         if schedule:
             self.root.after(500, self._refresh_ui)
 

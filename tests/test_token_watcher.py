@@ -85,6 +85,25 @@ class TokenWatcherTests(unittest.TestCase):
     def test_format_tokens_uses_exact_grouped_value(self) -> None:
         self.assertEqual(token_watcher.format_tokens(20_043_264_243), "20,043,264,243")
 
+    def test_text_foreground_inverts_plain_light_and_dark_backgrounds(self) -> None:
+        light = token_watcher.choose_text_foreground([(245, 245, 245)] * 20)
+        dark = token_watcher.choose_text_foreground([(20, 20, 20)] * 20)
+        self.assertEqual(light, "#111111")
+        self.assertEqual(dark, "#FFFFFF")
+
+    def test_text_foreground_chooses_best_worst_case_contrast(self) -> None:
+        pixels = (
+            [(250, 250, 250)] * 30
+            + [(190, 220, 250)] * 10
+            + [(255, 220, 40)] * 10
+        )
+        self.assertEqual(token_watcher.choose_text_foreground(pixels), "#111111")
+
+    def test_growth_animation_and_delta_keep_green_accent(self) -> None:
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertGreaterEqual(source.count('fill="#20D878"'), 4)
+        self.assertIn('self.delta_text_id, fill="#20D878"', source)
+
     def test_active_periods(self) -> None:
         now = date(2026, 7, 13)
         self.assertEqual(
