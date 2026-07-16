@@ -14,6 +14,7 @@ import tkinter as tk
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -58,6 +59,22 @@ CODEX_USAGE_KEYS = (
 CODEX_CACHE_VERSION = 2
 CLAUDE_CACHE_VERSION = 1
 USAGE_SNAPSHOT_CACHE_VERSION = 2
+WINDOWS_FONTS = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+CASCADIA_MONO_FONT = str(WINDOWS_FONTS / "CascadiaMono.ttf")
+YAHEI_FONT = str(WINDOWS_FONTS / "msyh.ttc")
+YAHEI_BOLD_FONT = str(WINDOWS_FONTS / "msyhbd.ttc")
+SRGB_TO_LINEAR_255 = tuple(
+    round(
+        (
+            (value / 255.0) / 12.92
+            if value / 255.0 <= 0.04045
+            else (((value / 255.0) + 0.055) / 1.055) ** 2.4
+        )
+        * 255
+    )
+    for value in range(256)
+)
+CONTRAST_THRESHOLD_255 = round(0.179 * 255)
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -94,6 +111,129 @@ def choose_text_foreground(
     if abs(black_score - white_score) < 0.15:
         return previous_foreground
     return "#111111" if black_score > white_score else "#FFFFFF"
+
+
+def contrast_color(pixel: tuple[int, int, int]) -> tuple[int, int, int, int]:
+    return (17, 17, 17, 255) if _relative_luminance(pixel) >= 0.179 else (
+        255,
+        255,
+        255,
+        255,
+    )
+
+
+def pixel_contrast_colors(background):
+    from PIL import Image
+
+    red, green, blue = background.convert("RGB").split()
+    linear_rgb = Image.merge(
+        "RGB",
+        (
+            red.point(SRGB_TO_LINEAR_255),
+            green.point(SRGB_TO_LINEAR_255),
+            blue.point(SRGB_TO_LINEAR_255),
+        ),
+    )
+    luminance = linear_rgb.convert("L", (0.2126, 0.7152, 0.0722, 0))
+    contrast_lookup = [
+        255 if value < CONTRAST_THRESHOLD_255 else 17 for value in range(256)
+    ]
+    return luminance.point(contrast_lookup).convert("RGBA")
+
+
+def render_pixel_contrast_text(
+    background,
+    text: str,
+    font_name: str,
+    font_size: int,
+    position: tuple[int, int],
+    anchor: str,
+    solid_color: str | None = None,
+):
+    from PIL import Image, ImageColor, ImageDraw, ImageFont
+
+    width, height = background.size
+    mask = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask)
+    font = _load_image_font(font_name, font_size)
+    draw.text(position, text, font=font, fill=255, anchor=anchor)
+    if solid_color is not None:
+        red, green, blue = ImageColor.getrgb(solid_color)
+        color = Image.new("RGBA", (width, height), (red, green, blue, 255))
+    else:
+        # Pillow applies the sRGB linearization and luminance operations in
+        # native code, preserving WCAG contrast behavior on saturated colors.
+        color = pixel_contrast_colors(background)
+    color.putalpha(mask)
+    return color
+
+
+@lru_cache(maxsize=32)
+def _load_image_font(font_name: str, font_size: int):
+    from PIL import ImageFont
+
+    return ImageFont.truetype(font_name, font_size)
+
+
+class AdaptiveCanvasText:
+    def __init__(
+        self,
+        canvas: tk.Canvas,
+        *,
+        text: str,
+        font_name: str,
+        font_size: int,
+        position: tuple[int, int],
+        anchor: str,
+    ):
+        self.canvas = canvas
+        self.text = text
+        self.font_name = font_name
+        self.font_size = font_size
+        self.position = position
+        self.anchor = anchor
+        self.solid_color: str | None = None
+        self.photo = None
+        self.image_id = canvas.create_image(0, 0, anchor="nw")
+        self.last_background = None
+        self.last_root = None
+
+    def set_text(self, text: str) -> None:
+        self.text = text
+        self.render_cached()
+
+    def hide(self) -> None:
+        self.canvas.itemconfigure(self.image_id, state="hidden")
+
+    def render(self, background, root: tk.Tk) -> None:
+        from PIL import ImageTk
+
+        width = max(1, self.canvas.winfo_width())
+        height = max(1, self.canvas.winfo_height())
+        x = self.canvas.winfo_rootx() - root.winfo_rootx()
+        y = self.canvas.winfo_rooty() - root.winfo_rooty()
+        crop = background.crop((x, y, x + width, y + height))
+        image = render_pixel_contrast_text(
+            crop,
+            self.text,
+            self.font_name,
+            self.font_size,
+            self.position,
+            self.anchor,
+            self.solid_color,
+        )
+        self.photo = ImageTk.PhotoImage(image)
+        self.canvas.itemconfigure(
+            self.image_id,
+            image=self.photo,
+            state="normal",
+        )
+        self.last_background = background
+        self.last_root = root
+
+    def render_cached(self) -> None:
+        if self.last_background is not None and self.last_root is not None:
+            self.render(self.last_background, self.last_root)
 
 
 def codex_usage_fingerprint(
@@ -1666,16 +1806,23 @@ class FloatingRankRow:
         self.frame.pack(fill="x", pady=1)
         self.frame.grid_columnconfigure(4, minsize=122)
         self.frame.grid_columnconfigure(5, minsize=215, weight=1)
-        medal_colors = ["#FFD166", "#D8E1EF", "#D99B66"]
-        self.rank_label = tk.Label(
+        self.rank_canvas = tk.Canvas(
             self.frame,
-            text=str(rank),
-            font=("Cascadia Mono", 10, "bold"),
-            fg=medal_colors[rank - 1],
             bg=transparent,
-            width=2,
+            width=26,
+            height=44,
+            highlightthickness=0,
+            borderwidth=0,
         )
-        self.rank_label.grid(row=0, column=0, padx=(0, 2), sticky="w")
+        self.rank_canvas.grid(row=0, column=0, padx=(0, 2), sticky="w")
+        self.rank_text = AdaptiveCanvasText(
+            self.rank_canvas,
+            text=str(rank),
+            font_name=CASCADIA_MONO_FONT,
+            font_size=20,
+            position=(2, 22),
+            anchor="lm",
+        )
         self.platform_canvas = tk.Canvas(
             self.frame,
             bg="#4C8DFF",
@@ -1702,13 +1849,13 @@ class FloatingRankRow:
             borderwidth=0,
         )
         self.model_canvas.grid(row=0, column=2, sticky="w", padx=(4, 3))
-        self.model_text_id = self.model_canvas.create_text(
-            2,
-            22,
+        self.model_text = AdaptiveCanvasText(
+            self.model_canvas,
             text="等待数据",
-            font=("Microsoft YaHei UI", 9, "bold"),
-            fill="#FFFFFF",
-            anchor="w",
+            font_name=YAHEI_BOLD_FONT,
+            font_size=18,
+            position=(2, 22),
+            anchor="lm",
         )
         self.call_canvas = tk.Canvas(
             self.frame,
@@ -1719,13 +1866,13 @@ class FloatingRankRow:
             borderwidth=0,
         )
         self.call_canvas.grid(row=0, column=3, sticky="w", padx=(0, 3))
-        self.call_text_id = self.call_canvas.create_text(
-            2,
-            22,
+        self.call_text = AdaptiveCanvasText(
+            self.call_canvas,
             text="0",
-            font=("Cascadia Mono", 9, "bold"),
-            fill="#FFFFFF",
-            anchor="w",
+            font_name=CASCADIA_MONO_FONT,
+            font_size=18,
+            position=(2, 22),
+            anchor="lm",
         )
         self.delta_canvas = tk.Canvas(
             self.frame,
@@ -1754,26 +1901,26 @@ class FloatingRankRow:
             borderwidth=0,
         )
         self.token_canvas.grid(row=0, column=5, sticky="e")
-        self.token_text_id = self.token_canvas.create_text(
-            200,
-            22,
+        self.token_text = AdaptiveCanvasText(
+            self.token_canvas,
             text="0",
-            font=("Cascadia Mono", 9, "bold"),
-            fill="#FFFFFF",
-            anchor="e",
+            font_name=CASCADIA_MONO_FONT,
+            font_size=18,
+            position=(200, 22),
+            anchor="rm",
         )
         self.delta_hide_job = None
         self.call_color_job = None
         self.call_animation_jobs = []
         self.call_incoming_text_id = None
         self.call_value = 0
-        self.call_foreground = "#FFFFFF"
-        self.model_foreground = "#FFFFFF"
+        self.call_foreground = None
+        self.model_foreground = None
         self.token_color_job = None
         self.token_animation_jobs = []
         self.token_incoming_text_id = None
         self.token_value = 0
-        self.token_foreground = "#FFFFFF"
+        self.token_foreground = None
         self.current_key: tuple[str, str] | None = None
 
     def update(
@@ -1796,13 +1943,7 @@ class FloatingRankRow:
         self.platform_canvas.itemconfigure(
             self.platform_text_id, text=display_platform
         )
-        self.model_canvas.itemconfigure(
-            self.model_text_id, text=compact_model_name(model)
-        )
-        if self.token_color_job is None and not self.token_animation_jobs:
-            self.model_canvas.itemconfigure(
-                self.model_text_id, fill=self.model_foreground
-            )
+        self.model_text.set_text(compact_model_name(model))
         self._update_token_value(
             value,
             animate=not key_changed and delta > 0,
@@ -1828,13 +1969,14 @@ class FloatingRankRow:
         if self.token_incoming_text_id is not None:
             self.token_canvas.delete(self.token_incoming_text_id)
             self.token_incoming_text_id = None
-        self.token_canvas.coords(self.token_text_id, 200, 22)
+        self.token_canvas.coords(self.token_text.image_id, 0, 0)
+        self.token_text.render_cached()
 
     def _update_token_value(
         self,
         value: int,
         animate: bool,
-        foreground: str,
+        foreground: str | None,
         force: bool = False,
     ) -> None:
         value = int(value)
@@ -1847,16 +1989,12 @@ class FloatingRankRow:
             self.token_color_job = None
         if not animate:
             self.token_value = value
-            self.token_canvas.itemconfigure(
-                self.token_text_id,
-                text=format_tokens(value),
-                fill=foreground,
-            )
-            self.token_canvas.coords(self.token_text_id, 200, 22)
-            self.model_canvas.itemconfigure(self.model_text_id, fill=foreground)
+            self.token_text.solid_color = foreground
+            self.token_text.set_text(format_tokens(value))
+            self.model_text.solid_color = self.model_foreground
+            self.model_text.render_cached()
             return
 
-        old_text_id = self.token_text_id
         new_text_id = self.token_canvas.create_text(
             200,
             66,
@@ -1866,31 +2004,39 @@ class FloatingRankRow:
             anchor="e",
         )
         self.token_incoming_text_id = new_text_id
-        self.model_canvas.itemconfigure(self.model_text_id, fill="#20D878")
+        self.model_text.solid_color = "#20D878"
+        self.model_text.render_cached()
         steps = 9
 
         def animate_step(step: int) -> None:
             progress = step / steps
-            self.token_canvas.coords(old_text_id, 200, 22 - round(44 * progress))
+            self.token_canvas.coords(
+                self.token_text.image_id, 0, -round(44 * progress)
+            )
             self.token_canvas.coords(new_text_id, 200, 66 - round(44 * progress))
             if step < steps:
                 job = self.frame.after(24, animate_step, step + 1)
                 self.token_animation_jobs.append(job)
                 return
-            self.token_canvas.delete(old_text_id)
-            self.token_text_id = new_text_id
+            self.token_canvas.coords(self.token_text.image_id, 0, 0)
+            self.token_canvas.delete(new_text_id)
             self.token_incoming_text_id = None
             self.token_value = value
             self.token_animation_jobs.clear()
+            self.token_text.solid_color = "#20D878"
+            self.token_text.set_text(format_tokens(value))
             self.token_color_job = self.frame.after(1100, self._restore_token_color)
 
         animate_step(1)
 
     def _restore_token_color(self) -> None:
-        self.token_canvas.itemconfigure(self.token_text_id, fill=self.token_foreground)
-        self.model_canvas.itemconfigure(
-            self.model_text_id, fill=self.model_foreground
-        )
+        if self.token_incoming_text_id is not None:
+            self.token_canvas.delete(self.token_incoming_text_id)
+            self.token_incoming_text_id = None
+        self.token_text.solid_color = self.token_foreground
+        self.token_text.set_text(format_tokens(self.token_value))
+        self.model_text.solid_color = self.model_foreground
+        self.model_text.render_cached()
         self.token_color_job = None
 
     def _cancel_call_animation(self) -> None:
@@ -1903,13 +2049,14 @@ class FloatingRankRow:
         if self.call_incoming_text_id is not None:
             self.call_canvas.delete(self.call_incoming_text_id)
             self.call_incoming_text_id = None
-        self.call_canvas.coords(self.call_text_id, 2, 22)
+        self.call_canvas.coords(self.call_text.image_id, 0, 0)
+        self.call_text.render_cached()
 
     def _update_call_value(
         self,
         value: int,
         animate: bool,
-        foreground: str,
+        foreground: str | None,
         force: bool = False,
     ) -> None:
         value = int(value)
@@ -1922,15 +2069,10 @@ class FloatingRankRow:
             self.call_color_job = None
         if not animate:
             self.call_value = value
-            self.call_canvas.itemconfigure(
-                self.call_text_id,
-                text=format_tokens(value),
-                fill=foreground,
-            )
-            self.call_canvas.coords(self.call_text_id, 2, 22)
+            self.call_text.solid_color = foreground
+            self.call_text.set_text(format_tokens(value))
             return
 
-        old_text_id = self.call_text_id
         new_text_id = self.call_canvas.create_text(
             2,
             66,
@@ -1944,23 +2086,31 @@ class FloatingRankRow:
 
         def animate_step(step: int) -> None:
             progress = step / steps
-            self.call_canvas.coords(old_text_id, 2, 22 - round(44 * progress))
+            self.call_canvas.coords(
+                self.call_text.image_id, 0, -round(44 * progress)
+            )
             self.call_canvas.coords(new_text_id, 2, 66 - round(44 * progress))
             if step < steps:
                 job = self.frame.after(24, animate_step, step + 1)
                 self.call_animation_jobs.append(job)
                 return
-            self.call_canvas.delete(old_text_id)
-            self.call_text_id = new_text_id
+            self.call_canvas.coords(self.call_text.image_id, 0, 0)
+            self.call_canvas.delete(new_text_id)
             self.call_incoming_text_id = None
             self.call_value = value
             self.call_animation_jobs.clear()
+            self.call_text.solid_color = "#20D878"
+            self.call_text.set_text(format_tokens(value))
             self.call_color_job = self.frame.after(1100, self._restore_call_color)
 
         animate_step(1)
 
     def _restore_call_color(self) -> None:
-        self.call_canvas.itemconfigure(self.call_text_id, fill=self.call_foreground)
+        if self.call_incoming_text_id is not None:
+            self.call_canvas.delete(self.call_incoming_text_id)
+            self.call_incoming_text_id = None
+        self.call_text.solid_color = self.call_foreground
+        self.call_text.set_text(format_tokens(self.call_value))
         self.call_color_job = None
 
     def _show_delta(self, delta: int) -> None:
@@ -1978,38 +2128,25 @@ class FloatingRankRow:
         self.delta_hide_job = None
 
     def set_foreground(self, foreground: str) -> None:
-        self.set_foregrounds(
-            foreground,
-            foreground,
-            foreground,
-            foreground,
-        )
+        self.set_solid_color(foreground)
 
-    def set_foregrounds(
-        self,
-        rank: str,
-        model: str,
-        call: str,
-        token: str,
-    ) -> None:
-        self.model_foreground = model
-        self.call_foreground = call
-        self.token_foreground = token
-        self.rank_label.configure(fg=rank)
-        if self.token_color_job is None and not self.token_animation_jobs:
-            self.model_canvas.itemconfigure(self.model_text_id, fill=model)
-            self.token_canvas.itemconfigure(self.token_text_id, fill=token)
-        if self.call_color_job is None and not self.call_animation_jobs:
-            self.call_canvas.itemconfigure(self.call_text_id, fill=call)
+    def set_solid_color(self, color: str | None) -> None:
+        self.model_foreground = color
+        self.call_foreground = color
+        self.token_foreground = color
+        for text in (self.rank_text, self.model_text, self.call_text, self.token_text):
+            text.solid_color = color
+            text.render_cached()
         self.delta_canvas.itemconfigure(self.delta_text_id, fill="#20D878")
+
+    def adaptive_texts(self) -> tuple[AdaptiveCanvasText, ...]:
+        return self.rank_text, self.model_text, self.call_text, self.token_text
 
 class LiveUsageApp:
     def __init__(self, engine: UsageEngine, screenshot_path: Path | None = None):
         self.engine = engine
         self.period = "cumulative"
         self.transparent = "#010101"
-        self.foreground = "#FFFFFF"
-        self.live_foreground = "#FFFFFF"
         self.drag_origin: tuple[int, int] | None = None
         self.previous_values = {period: {} for period in PERIODS}
         self.previous_calls = {period: {} for period in PERIODS}
@@ -2049,38 +2186,67 @@ class LiveUsageApp:
         self.header = tk.Frame(self.shell, bg=self.transparent)
         header = self.header
         header.pack(fill="x", pady=(0, 2))
-        self.title_label = tk.Label(
+        self.title_canvas = tk.Canvas(
             header,
+            bg=self.transparent,
+            width=180,
+            height=28,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.title_canvas.pack(side="left")
+        self.title_text = AdaptiveCanvasText(
+            self.title_canvas,
             text="AI TOKEN TOP 3",
-            font=("Cascadia Mono", 10, "bold"),
-            fg=self.foreground,
-            bg=self.transparent,
+            font_name=CASCADIA_MONO_FONT,
+            font_size=20,
+            position=(1, 14),
+            anchor="lm",
         )
-        self.title_label.pack(side="left")
-        self.live_label = tk.Label(
+        self.live_canvas = tk.Canvas(
             header,
-            text="AUTO ●",
-            font=("Microsoft YaHei UI", 9, "bold"),
-            fg="#F6C453",
             bg=self.transparent,
+            width=72,
+            height=28,
+            highlightthickness=0,
+            borderwidth=0,
         )
-        self.live_label.pack(side="right", padx=(5, 0))
+        self.live_canvas.pack(side="right", padx=(5, 0))
+        self.live_text = AdaptiveCanvasText(
+            self.live_canvas,
+            text="AUTO ●",
+            font_name=YAHEI_BOLD_FONT,
+            font_size=18,
+            position=(70, 14),
+            anchor="rm",
+        )
         self.period_frame = tk.Frame(header, bg=self.transparent)
         self.period_frame.pack(side="right", padx=(12, 5))
-        self.period_labels = {}
+        self.period_texts = {}
         for period in PERIODS:
-            label = tk.Label(
+            canvas = tk.Canvas(
                 self.period_frame,
-                text=PERIOD_LABELS[period],
-                font=("Microsoft YaHei UI", 9, "bold"),
-                fg=self.foreground,
                 bg=self.transparent,
-                padx=6,
+                width=52,
+                height=28,
+                highlightthickness=0,
+                borderwidth=0,
                 cursor="hand2",
             )
-            label.pack(side="left")
-            label.bind("<Button-1>", lambda _event, value=period: self._set_period(value))
-            self.period_labels[period] = label
+            canvas.pack(side="left")
+            text = AdaptiveCanvasText(
+                canvas,
+                text=PERIOD_LABELS[period],
+                font_name=YAHEI_BOLD_FONT,
+                font_size=18,
+                position=(26, 14),
+                anchor="mm",
+            )
+            canvas.bind(
+                "<Button-1>",
+                lambda _event, value=period: self._set_period(value),
+            )
+            self.period_texts[period] = text
         self.rows_container = tk.Frame(self.shell, bg=self.transparent)
         self.rows_container.pack(fill="x")
         self.cards = [
@@ -2089,37 +2255,51 @@ class LiveUsageApp:
         ]
         self.footer_frame = tk.Frame(self.shell, bg=self.transparent)
         self.footer_frame.pack(fill="x", pady=(2, 0))
-        self.color_toggle_label = tk.Label(
+        self.color_toggle_canvas = tk.Canvas(
             self.footer_frame,
-            text="白字",
-            font=("Microsoft YaHei UI", 7, "bold"),
-            fg=self.foreground,
             bg=self.transparent,
-            padx=4,
-            pady=1,
-            borderwidth=1,
-            relief="solid",
+            width=48,
+            height=24,
+            highlightthickness=0,
+            borderwidth=0,
             cursor="hand2",
         )
-        self.color_toggle_label.pack(side="left")
-        self.color_toggle_label.bind("<Button-1>", self._toggle_foreground)
-        self.color_toggle_label.bind("<Button-3>", self._show_menu)
-        self.footer_label = tk.Label(
-            self.footer_frame,
-            text="0.5s",
-            font=("Cascadia Mono", 7),
-            fg=self.foreground,
-            bg=self.transparent,
+        self.color_toggle_canvas.pack(side="left")
+        self.color_toggle_text = AdaptiveCanvasText(
+            self.color_toggle_canvas,
+            text="自动",
+            font_name=YAHEI_BOLD_FONT,
+            font_size=15,
+            position=(2, 12),
+            anchor="lm",
         )
-        self.footer_label.pack(side="right")
+        self.color_toggle_canvas.bind("<Button-1>", self._toggle_foreground)
+        self.color_toggle_canvas.bind("<Button-3>", self._show_menu)
+        self.footer_canvas = tk.Canvas(
+            self.footer_frame,
+            bg=self.transparent,
+            width=500,
+            height=24,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.footer_canvas.pack(side="right")
+        self.footer_text = AdaptiveCanvasText(
+            self.footer_canvas,
+            text="0.5s",
+            font_name=YAHEI_FONT,
+            font_size=15,
+            position=(498, 12),
+            anchor="rm",
+        )
         for widget in (
             self.shell,
             self.header,
-            self.title_label,
-            self.live_label,
+            self.title_canvas,
+            self.live_canvas,
             self.rows_container,
             self.footer_frame,
-            self.footer_label,
+            self.footer_canvas,
         ):
             self._bind_window_actions(widget)
         for card in self.cards:
@@ -2156,9 +2336,11 @@ class LiveUsageApp:
         self._update_period_styles()
 
     def _update_period_styles(self) -> None:
-        for period, label in self.period_labels.items():
-            label.configure(
-                text=f"• {PERIOD_LABELS[period]}" if period == self.period else PERIOD_LABELS[period],
+        for period, text in self.period_texts.items():
+            text.set_text(
+                f"• {PERIOD_LABELS[period]}"
+                if period == self.period
+                else PERIOD_LABELS[period]
             )
 
     def _capture_background(self):
@@ -2176,79 +2358,50 @@ class LiveUsageApp:
         except Exception:
             return None
 
-    def _widget_foreground(self, image, widget: tk.Widget, previous: str) -> str:
-        x = widget.winfo_rootx() - self.root.winfo_rootx()
-        y = widget.winfo_rooty() - self.root.winfo_rooty()
-        width = widget.winfo_width()
-        height = widget.winfo_height()
-        if width <= 0 or height <= 0:
-            return previous
-        crop = image.crop((x, y, x + width, y + height)).resize((12, 4))
-        return choose_text_foreground(list(crop.getdata()), previous)
+    def _adaptive_texts(self) -> tuple[AdaptiveCanvasText, ...]:
+        texts = [
+            self.title_text,
+            self.live_text,
+            *self.period_texts.values(),
+            self.color_toggle_text,
+            self.footer_text,
+        ]
+        for card in self.cards:
+            texts.extend(card.adaptive_texts())
+        return tuple(texts)
 
     def _apply_adaptive_foregrounds(self) -> None:
+        texts = self._adaptive_texts()
+        for text in texts:
+            text.hide()
+        self.root.update_idletasks()
         image = self._capture_background()
         if image is None:
+            for text in texts:
+                text.render_cached()
             return
-        self.foreground = self._widget_foreground(
-            image, self.title_label, self.foreground
-        )
-        self.title_label.configure(fg=self.foreground)
-        for label in self.period_labels.values():
-            foreground = self._widget_foreground(
-                image, label, str(label.cget("fg"))
-            )
-            label.configure(fg=foreground)
-        for card in self.cards:
-            card.set_foregrounds(
-                self._widget_foreground(
-                    image, card.rank_label, str(card.rank_label.cget("fg"))
-                ),
-                self._widget_foreground(
-                    image, card.model_canvas, card.model_foreground
-                ),
-                self._widget_foreground(
-                    image, card.call_canvas, card.call_foreground
-                ),
-                self._widget_foreground(
-                    image, card.token_canvas, card.token_foreground
-                ),
-            )
-        self.footer_label.configure(
-            fg=self._widget_foreground(
-                image, self.footer_label, str(self.footer_label.cget("fg"))
-            )
-        )
-        self.color_toggle_label.configure(
-            text="自动",
-            fg=self._widget_foreground(
-                image,
-                self.color_toggle_label,
-                str(self.color_toggle_label.cget("fg")),
-            ),
-        )
-        self.live_foreground = self._widget_foreground(
-            image, self.live_label, self.live_foreground
-        )
-        self.live_label.configure(fg=self.live_foreground)
-        self.root.deiconify()
-        self.root.lift()
+        for text in texts:
+            text.render(image, self.root)
+        if self.root.state() == "withdrawn":
+            self.root.deiconify()
+            self.root.lift()
 
     def _toggle_foreground(self, _event=None) -> None:
         self.manual_foreground = not self.manual_foreground
         if self.manual_foreground:
-            target = "#111111" if self.foreground == "#FFFFFF" else "#FFFFFF"
-            self.foreground = target
-            self.title_label.configure(fg=target)
-            self.footer_label.configure(fg=target)
-            for label in self.period_labels.values():
-                label.configure(fg=target)
+            target = "#111111"
+            for text in self._adaptive_texts():
+                text.solid_color = target
+                text.render_cached()
             for card in self.cards:
                 card.set_foreground(target)
-            self.color_toggle_label.configure(
-                text="手动白" if target == "#FFFFFF" else "手动黑", fg=target
-            )
+            self.color_toggle_text.set_text("手动黑")
         else:
+            for text in self._adaptive_texts():
+                text.solid_color = None
+            for card in self.cards:
+                card.set_solid_color(None)
+            self.color_toggle_text.set_text("自动")
             self._apply_adaptive_foregrounds()
 
     def _start_drag(self, event) -> None:
@@ -2302,10 +2455,10 @@ class LiveUsageApp:
                 f"{snapshot.updated_at.strftime('%H:%M:%S.%f')[:-3]}  ·  0.5 秒"
             )
             if snapshot.error:
-                self.live_label.configure(text="AUTO ×", fg=self.live_foreground)
+                self.live_text.set_text("AUTO ×")
             else:
-                self.live_label.configure(text="AUTO ●", fg=self.live_foreground)
-            self.footer_label.configure(text=source_text)
+                self.live_text.set_text("AUTO ●")
+            self.footer_text.set_text(source_text)
             if (
                 not self.manual_foreground
                 and time.monotonic() - self.last_background_check >= 1.0

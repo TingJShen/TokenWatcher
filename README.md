@@ -11,10 +11,10 @@ TokenWatcher is a lightweight Windows desktop overlay that displays the three mo
 - Codex cumulative-snapshot deduplication across continued or forked tasks
 - Persistent Codex fingerprint/offset cache for fast restarts
 - Immediate startup display from the last verified aggregate snapshot; live sources reconcile it in the background
-- Per-field automatic foreground inversion while the overlay remains fully transparent
+- Per-glyph-pixel background inversion, allowing one character to be partly black and partly white while the overlay remains transparent
 - Green rolling animation when a value increases
 - Transparent, always-on-top, draggable window
-- Automatic black/white text selection based on the desktop background
+- WCAG-relative-luminance contrast selection for saturated and multicolored backgrounds
 - Manual black/white text toggle
 - Single-instance protection
 - No telemetry or data upload

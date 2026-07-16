@@ -99,10 +99,50 @@ class TokenWatcherTests(unittest.TestCase):
         )
         self.assertEqual(token_watcher.choose_text_foreground(pixels), "#111111")
 
+    def test_pixel_contrast_text_can_split_one_glyph_between_black_and_white(self) -> None:
+        from PIL import Image
+
+        background = Image.new("RGB", (80, 40), "white")
+        for x in range(40, 80):
+            for y in range(40):
+                background.putpixel((x, y), (0, 0, 0))
+        rendered = token_watcher.render_pixel_contrast_text(
+            background,
+            "W",
+            token_watcher.CASCADIA_MONO_FONT,
+            36,
+            (40, 20),
+            "mm",
+        )
+        colors = {
+            pixel[:3]
+            for pixel in rendered.getdata()
+            if pixel[3] > 0
+        }
+        self.assertIn((17, 17, 17), colors)
+        self.assertIn((255, 255, 255), colors)
+
+    def test_pixel_contrast_uses_linear_rgb_on_colorful_backgrounds(self) -> None:
+        from PIL import Image
+
+        background = Image.new("RGB", (3, 1))
+        background.putdata([(255, 0, 0), (0, 0, 255), (255, 0, 255)])
+        colors = list(token_watcher.pixel_contrast_colors(background).getdata())
+        self.assertEqual(
+            colors,
+            [
+                (17, 17, 17, 255),
+                (255, 255, 255, 255),
+                (17, 17, 17, 255),
+            ],
+        )
+
     def test_growth_animation_and_delta_keep_green_accent(self) -> None:
         source = MODULE_PATH.read_text(encoding="utf-8")
         self.assertGreaterEqual(source.count('fill="#20D878"'), 4)
         self.assertIn('self.delta_text_id, fill="#20D878"', source)
+        self.assertIn('self.token_text.solid_color = "#20D878"', source)
+        self.assertIn('self.call_text.solid_color = "#20D878"', source)
 
     def test_active_periods(self) -> None:
         now = date(2026, 7, 13)
