@@ -146,6 +146,10 @@ class TokenWatcherTests(unittest.TestCase):
         self.assertIn('highlightthickness=0', source)
         self.assertIn('borderwidth=0', source)
         self.assertIn('TOKENWATCHER_WINDOW_GEOMETRY', source)
+        self.assertIn("import re", source)
+        self.assertTrue(
+            token_watcher.re.fullmatch(r"\d+x\d+[+-]\d+[+-]\d+", "860x260+3270+1640")
+        )
 
     def test_growth_animation_and_delta_keep_green_accent(self) -> None:
         source = MODULE_PATH.read_text(encoding="utf-8")
