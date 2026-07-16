@@ -99,14 +99,14 @@ class TokenWatcherTests(unittest.TestCase):
         )
         self.assertEqual(token_watcher.choose_text_foreground(pixels), "#000000")
 
-    def test_pixel_contrast_text_can_split_one_glyph_between_black_and_white(self) -> None:
+    def test_adaptive_text_uses_one_solid_color_across_a_split_background(self) -> None:
         from PIL import Image
 
         background = Image.new("RGB", (80, 40), "white")
         for x in range(40, 80):
             for y in range(40):
                 background.putpixel((x, y), (0, 0, 0))
-        rendered = token_watcher.render_pixel_contrast_text(
+        rendered = token_watcher.render_solid_contrast_text(
             background,
             "W",
             token_watcher.CASCADIA_MONO_FONT,
@@ -119,27 +119,32 @@ class TokenWatcherTests(unittest.TestCase):
             for pixel in rendered.getdata()
             if pixel[3] > 0
         }
-        self.assertIn((0, 0, 0), colors)
-        self.assertIn((255, 255, 255), colors)
+        self.assertEqual(len(colors), 1)
+        self.assertTrue(colors <= {(0, 0, 0), (255, 255, 255)})
 
-    def test_pixel_contrast_uses_exact_rgb_inverse_on_colorful_backgrounds(self) -> None:
+    def test_saturated_backgrounds_choose_uniform_black_or_white(self) -> None:
         from PIL import Image
 
-        background = Image.new("RGB", (5, 1))
-        background.putdata(
-            [(255, 0, 0), (0, 255, 0), (0, 0, 255), (80, 120, 200), (0, 0, 0)]
+        cases = (
+            ((255, 0, 0), (0, 0, 0)),
+            ((0, 255, 0), (0, 0, 0)),
+            ((0, 0, 255), (255, 255, 255)),
         )
-        colors = list(token_watcher.pixel_contrast_colors(background).getdata())
-        self.assertEqual(
-            colors,
-            [
-                (0, 255, 255, 255),
-                (255, 0, 255, 255),
-                (255, 255, 0, 255),
-                (175, 135, 55, 255),
-                (255, 255, 255, 255),
-            ],
-        )
+        for background_color, expected in cases:
+            rendered = token_watcher.render_solid_contrast_text(
+                Image.new("RGB", (80, 40), background_color),
+                "W",
+                token_watcher.CASCADIA_MONO_FONT,
+                36,
+                (40, 20),
+                "mm",
+            )
+            colors = {
+                pixel[:3]
+                for pixel in rendered.getdata()
+                if pixel[3] > 0
+            }
+            self.assertEqual(colors, {expected})
 
     def test_adaptive_refresh_replaces_prepared_layers_without_hiding(self) -> None:
         source = MODULE_PATH.read_text(encoding="utf-8")
@@ -155,7 +160,7 @@ class TokenWatcherTests(unittest.TestCase):
         from PIL import Image
 
         background = Image.new("RGB", (250, 56), "white")
-        rendered = token_watcher.render_pixel_contrast_text(
+        rendered = token_watcher.render_solid_contrast_text(
             background,
             "9,999,999,999",
             token_watcher.CASCADIA_MONO_FONT,
@@ -171,6 +176,9 @@ class TokenWatcherTests(unittest.TestCase):
         self.assertNotIn("stroke_width=1", source)
         self.assertIn("GetWindowRect", source)
         self.assertIn("GetDpiForWindow", source)
+        self.assertIn("SetWindowDisplayAffinity", source)
+        self.assertIn("0x00000011", source)
+        self.assertIn("DwmFlush", source)
         self.assertIn("rect.right / dpi_scale", source)
         self.assertIn("_compose_visual_snapshot", source)
         self.assertIn("image.alpha_composite(text.last_image", source)

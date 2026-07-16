@@ -108,18 +108,7 @@ def choose_text_foreground(
     return "#000000" if black_score > white_score else "#FFFFFF"
 
 
-def contrast_color(pixel: tuple[int, int, int]) -> tuple[int, int, int, int]:
-    red, green, blue = pixel
-    return 255 - red, 255 - green, 255 - blue, 255
-
-
-def pixel_contrast_colors(background):
-    from PIL import ImageOps
-
-    return ImageOps.invert(background.convert("RGB")).convert("RGBA")
-
-
-def render_pixel_contrast_text(
+def _render_solid_contrast_text(
     background,
     text: str,
     font_name: str,
@@ -127,6 +116,7 @@ def render_pixel_contrast_text(
     position: tuple[int, int],
     anchor: str,
     solid_color: str | None = None,
+    previous_foreground: str = "#FFFFFF",
 ):
     from PIL import Image, ImageColor, ImageDraw, ImageFont
 
@@ -135,15 +125,45 @@ def render_pixel_contrast_text(
     draw = ImageDraw.Draw(mask)
     font = _load_image_font(font_name, font_size)
     draw.text(position, text, font=font, fill=255, anchor=anchor)
-    if solid_color is not None:
-        red, green, blue = ImageColor.getrgb(solid_color)
-        color = Image.new("RGBA", (width, height), (red, green, blue, 255))
-    else:
-        # Pillow applies the sRGB linearization and luminance operations in
-        # native code, preserving WCAG contrast behavior on saturated colors.
-        color = pixel_contrast_colors(background)
+    selected_color = solid_color
+    if selected_color is None:
+        rgb_background = background.convert("RGB")
+        glyph_pixels = [
+            pixel
+            for pixel, alpha in zip(rgb_background.getdata(), mask.getdata())
+            if alpha >= 32
+        ]
+        selected_color = choose_text_foreground(
+            glyph_pixels,
+            previous_foreground,
+        )
+    red, green, blue = ImageColor.getrgb(selected_color)
+    color = Image.new("RGBA", (width, height), (red, green, blue, 255))
     color.putalpha(mask)
-    return color
+    return color, selected_color
+
+
+def render_solid_contrast_text(
+    background,
+    text: str,
+    font_name: str,
+    font_size: int,
+    position: tuple[int, int],
+    anchor: str,
+    solid_color: str | None = None,
+    previous_foreground: str = "#FFFFFF",
+):
+    image, _ = _render_solid_contrast_text(
+        background,
+        text,
+        font_name,
+        font_size,
+        position,
+        anchor,
+        solid_color,
+        previous_foreground,
+    )
+    return image
 
 
 @lru_cache(maxsize=32)
@@ -171,6 +191,7 @@ class AdaptiveCanvasText:
         self.position = position
         self.anchor = anchor
         self.solid_color: str | None = None
+        self.automatic_foreground = "#FFFFFF"
         self.photo = None
         self.last_image = None
         self.image_id = canvas.create_image(0, 0, anchor="nw")
@@ -190,7 +211,7 @@ class AdaptiveCanvasText:
         x = self.canvas.winfo_rootx() - root.winfo_rootx()
         y = self.canvas.winfo_rooty() - root.winfo_rooty()
         crop = background.crop((x, y, x + width, y + height))
-        return render_pixel_contrast_text(
+        image, selected_color = _render_solid_contrast_text(
             crop,
             self.text,
             self.font_name,
@@ -198,7 +219,11 @@ class AdaptiveCanvasText:
             self.position,
             self.anchor,
             self.solid_color,
+            self.automatic_foreground,
         )
+        if self.solid_color is None:
+            self.automatic_foreground = selected_color
+        return image
 
     def apply_prepared(self, image, background, root: tk.Tk) -> None:
         from PIL import ImageTk
@@ -2371,11 +2396,18 @@ class LiveUsageApp:
                 import ctypes
                 import ctypes.wintypes
 
-                hwnd = ctypes.windll.user32.GetAncestor(self.root.winfo_id(), 2)
+                user32 = ctypes.windll.user32
+                hwnd = user32.GetAncestor(self.root.winfo_id(), 2)
+                # Keep the overlay visible while excluding it from the image
+                # used for contrast sampling. The previous foreground cannot
+                # feed back into the next pure black/white choice, and no
+                # visible hide/show frame is needed.
+                user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+                ctypes.windll.dwmapi.DwmFlush()
                 rect = ctypes.wintypes.RECT()
-                if hwnd and ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                if hwnd and user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                     get_dpi_for_window = getattr(
-                        ctypes.windll.user32,
+                        user32,
                         "GetDpiForWindow",
                         None,
                     )
