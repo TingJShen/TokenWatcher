@@ -117,11 +117,11 @@ def choose_text_foreground(
     white_score = _percentile(white_contrasts, 0.2)
     if abs(black_score - white_score) < 0.15:
         return previous_foreground
-    return "#111111" if black_score > white_score else "#FFFFFF"
+    return "#000000" if black_score > white_score else "#FFFFFF"
 
 
 def contrast_color(pixel: tuple[int, int, int]) -> tuple[int, int, int, int]:
-    return (17, 17, 17, 255) if _relative_luminance(pixel) >= 0.179 else (
+    return (0, 0, 0, 255) if _relative_luminance(pixel) >= 0.179 else (
         255,
         255,
         255,
@@ -143,7 +143,7 @@ def pixel_contrast_colors(background):
     )
     luminance = linear_rgb.convert("L", (0.2126, 0.7152, 0.0722, 0))
     contrast_lookup = [
-        255 if value < CONTRAST_THRESHOLD_255 else 17 for value in range(256)
+        255 if value < CONTRAST_THRESHOLD_255 else 0 for value in range(256)
     ]
     return luminance.point(contrast_lookup).convert("RGBA")
 
@@ -163,7 +163,15 @@ def render_pixel_contrast_text(
     mask = Image.new("L", (width, height), 0)
     draw = ImageDraw.Draw(mask)
     font = _load_image_font(font_name, font_size)
-    draw.text(position, text, font=font, fill=255, anchor=anchor)
+    draw.text(
+        position,
+        text,
+        font=font,
+        fill=255,
+        anchor=anchor,
+        stroke_width=1,
+        stroke_fill=255,
+    )
     if solid_color is not None:
         red, green, blue = ImageColor.getrgb(solid_color)
         color = Image.new("RGBA", (width, height), (red, green, blue, 255))
@@ -2408,7 +2416,7 @@ class LiveUsageApp:
     def _toggle_foreground(self, _event=None) -> None:
         self.manual_foreground = not self.manual_foreground
         if self.manual_foreground:
-            target = "#111111"
+            target = "#000000"
             for text in self._adaptive_texts():
                 text.solid_color = target
                 text.render_cached()

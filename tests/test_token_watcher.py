@@ -88,7 +88,7 @@ class TokenWatcherTests(unittest.TestCase):
     def test_text_foreground_inverts_plain_light_and_dark_backgrounds(self) -> None:
         light = token_watcher.choose_text_foreground([(245, 245, 245)] * 20)
         dark = token_watcher.choose_text_foreground([(20, 20, 20)] * 20)
-        self.assertEqual(light, "#111111")
+        self.assertEqual(light, "#000000")
         self.assertEqual(dark, "#FFFFFF")
 
     def test_text_foreground_chooses_best_worst_case_contrast(self) -> None:
@@ -97,7 +97,7 @@ class TokenWatcherTests(unittest.TestCase):
             + [(190, 220, 250)] * 10
             + [(255, 220, 40)] * 10
         )
-        self.assertEqual(token_watcher.choose_text_foreground(pixels), "#111111")
+        self.assertEqual(token_watcher.choose_text_foreground(pixels), "#000000")
 
     def test_pixel_contrast_text_can_split_one_glyph_between_black_and_white(self) -> None:
         from PIL import Image
@@ -119,7 +119,7 @@ class TokenWatcherTests(unittest.TestCase):
             for pixel in rendered.getdata()
             if pixel[3] > 0
         }
-        self.assertIn((17, 17, 17), colors)
+        self.assertIn((0, 0, 0), colors)
         self.assertIn((255, 255, 255), colors)
 
     def test_pixel_contrast_uses_linear_rgb_on_colorful_backgrounds(self) -> None:
@@ -131,11 +131,28 @@ class TokenWatcherTests(unittest.TestCase):
         self.assertEqual(
             colors,
             [
-                (17, 17, 17, 255),
+                (0, 0, 0, 255),
                 (255, 255, 255, 255),
-                (17, 17, 17, 255),
+                (0, 0, 0, 255),
             ],
         )
+
+    def test_white_background_renders_dense_opaque_black_text(self) -> None:
+        from PIL import Image
+
+        background = Image.new("RGB", (250, 56), "white")
+        rendered = token_watcher.render_pixel_contrast_text(
+            background,
+            "9,999,999,999",
+            token_watcher.CASCADIA_MONO_FONT,
+            token_watcher.BODY_FONT_SIZE,
+            (248, token_watcher.ROW_MIDDLE),
+            "rm",
+        )
+        opaque_black = sum(
+            1 for pixel in rendered.getdata() if pixel == (0, 0, 0, 255)
+        )
+        self.assertGreater(opaque_black, 900)
 
     def test_overlay_layout_uses_large_borderless_text(self) -> None:
         self.assertGreaterEqual(token_watcher.BODY_FONT_SIZE, 26)
