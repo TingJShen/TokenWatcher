@@ -137,7 +137,7 @@ class TokenWatcherTests(unittest.TestCase):
             ],
         )
 
-    def test_white_background_renders_dense_opaque_black_text(self) -> None:
+    def test_white_background_renders_crisp_opaque_black_text(self) -> None:
         from PIL import Image
 
         background = Image.new("RGB", (250, 56), "white")
@@ -152,7 +152,14 @@ class TokenWatcherTests(unittest.TestCase):
         opaque_black = sum(
             1 for pixel in rendered.getdata() if pixel == (0, 0, 0, 255)
         )
-        self.assertGreater(opaque_black, 900)
+        self.assertGreater(opaque_black, 600)
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("stroke_width=1", source)
+        self.assertIn("GetWindowRect", source)
+        self.assertIn("GetDpiForWindow", source)
+        self.assertIn("rect.right / dpi_scale", source)
+        self.assertIn("_compose_visual_snapshot", source)
+        self.assertIn("image.alpha_composite(text.last_image", source)
 
     def test_overlay_layout_uses_large_borderless_text(self) -> None:
         self.assertGreaterEqual(token_watcher.BODY_FONT_SIZE, 26)

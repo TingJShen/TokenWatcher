@@ -163,15 +163,7 @@ def render_pixel_contrast_text(
     mask = Image.new("L", (width, height), 0)
     draw = ImageDraw.Draw(mask)
     font = _load_image_font(font_name, font_size)
-    draw.text(
-        position,
-        text,
-        font=font,
-        fill=255,
-        anchor=anchor,
-        stroke_width=1,
-        stroke_fill=255,
-    )
+    draw.text(position, text, font=font, fill=255, anchor=anchor)
     if solid_color is not None:
         red, green, blue = ImageColor.getrgb(solid_color)
         color = Image.new("RGBA", (width, height), (red, green, blue, 255))
@@ -209,6 +201,7 @@ class AdaptiveCanvasText:
         self.anchor = anchor
         self.solid_color: str | None = None
         self.photo = None
+        self.last_image = None
         self.image_id = canvas.create_image(0, 0, anchor="nw")
         self.last_background = None
         self.last_root = None
@@ -237,6 +230,7 @@ class AdaptiveCanvasText:
             self.anchor,
             self.solid_color,
         )
+        self.last_image = image
         self.photo = ImageTk.PhotoImage(image)
         self.canvas.itemconfigure(
             self.image_id,
@@ -2374,14 +2368,42 @@ class LiveUsageApp:
         try:
             from PIL import ImageGrab
 
-            x = self.root.winfo_rootx()
-            y = self.root.winfo_rooty()
             width = self.root.winfo_width()
             height = self.root.winfo_height()
-            return ImageGrab.grab(
-                (x, y, x + width, y + height),
+            x = self.root.winfo_rootx()
+            y = self.root.winfo_rooty()
+            right = x + width
+            bottom = y + height
+            if os.name == "nt":
+                import ctypes
+                import ctypes.wintypes
+
+                hwnd = ctypes.windll.user32.GetAncestor(self.root.winfo_id(), 2)
+                rect = ctypes.wintypes.RECT()
+                if hwnd and ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    get_dpi_for_window = getattr(
+                        ctypes.windll.user32,
+                        "GetDpiForWindow",
+                        None,
+                    )
+                    dpi_scale = (
+                        max(1.0, get_dpi_for_window(hwnd) / 96.0)
+                        if get_dpi_for_window is not None
+                        else 1.0
+                    )
+                    x, y, right, bottom = (
+                        round(rect.left / dpi_scale),
+                        round(rect.top / dpi_scale),
+                        round(rect.right / dpi_scale),
+                        round(rect.bottom / dpi_scale),
+                    )
+            image = ImageGrab.grab(
+                (x, y, right, bottom),
                 all_screens=True,
             ).convert("RGB")
+            if image.size != (width, height):
+                image = image.resize((width, height))
+            return image
         except Exception:
             return None
 
@@ -2499,23 +2521,72 @@ class LiveUsageApp:
         if not self.screenshot_path:
             return
         try:
-            from PIL import ImageGrab
-
-            self.root.deiconify()
-            self.root.attributes("-topmost", True)
-            self.root.lift()
-            self.root.focus_force()
-            self.root.update()
-            time.sleep(0.4)
-            x = self.root.winfo_rootx()
-            y = self.root.winfo_rooty()
-            width = self.root.winfo_width()
-            height = self.root.winfo_height()
-            image = ImageGrab.grab((x, y, x + width, y + height))
+            image = self._compose_visual_snapshot()
             self.screenshot_path.parent.mkdir(parents=True, exist_ok=True)
             image.save(self.screenshot_path)
         finally:
             self.close()
+
+    def _compose_visual_snapshot(self):
+        from PIL import Image, ImageColor, ImageDraw
+
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        background = next(
+            (
+                text.last_background
+                for text in self._adaptive_texts()
+                if text.last_background is not None
+            ),
+            None,
+        )
+        if background is None:
+            background = Image.new("RGB", (width, height), "white")
+        image = background.resize((width, height)).convert("RGBA")
+        for text in self._adaptive_texts():
+            if text.last_image is None:
+                continue
+            x = text.canvas.winfo_rootx() - self.root.winfo_rootx()
+            y = text.canvas.winfo_rooty() - self.root.winfo_rooty()
+            image.alpha_composite(text.last_image, (x, y))
+
+        draw = ImageDraw.Draw(image)
+        badge_font = _load_image_font(YAHEI_BOLD_FONT, 22)
+        delta_font = _load_image_font(CASCADIA_MONO_FONT, 22)
+        for card in self.cards:
+            canvas = card.platform_canvas
+            x = canvas.winfo_rootx() - self.root.winfo_rootx()
+            y = canvas.winfo_rooty() - self.root.winfo_rooty()
+            badge_width = canvas.winfo_width()
+            badge_height = canvas.winfo_height()
+            draw.rectangle(
+                (x, y, x + badge_width - 1, y + badge_height - 1),
+                fill=ImageColor.getrgb(str(canvas.cget("bg"))),
+            )
+            draw.text(
+                (x + badge_width // 2, y + badge_height // 2),
+                str(canvas.itemcget(card.platform_text_id, "text")),
+                font=badge_font,
+                fill="#FFFFFF",
+                anchor="mm",
+            )
+
+            delta = str(card.delta_canvas.itemcget(card.delta_text_id, "text"))
+            if delta:
+                delta_x = (
+                    card.delta_canvas.winfo_rootx() - self.root.winfo_rootx()
+                )
+                delta_y = (
+                    card.delta_canvas.winfo_rooty() - self.root.winfo_rooty()
+                )
+                draw.text(
+                    (delta_x + 138, delta_y + ROW_MIDDLE),
+                    delta,
+                    font=delta_font,
+                    fill="#20D878",
+                    anchor="rm",
+                )
+        return image.convert("RGB")
 
     def close(self) -> None:
         self.engine.stop()
