@@ -137,6 +137,16 @@ class TokenWatcherTests(unittest.TestCase):
             ],
         )
 
+    def test_overlay_layout_uses_large_borderless_text(self) -> None:
+        self.assertGreaterEqual(token_watcher.BODY_FONT_SIZE, 26)
+        self.assertGreaterEqual(token_watcher.TITLE_FONT_SIZE, 28)
+        self.assertGreaterEqual(token_watcher.ROW_HEIGHT, 56)
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn('self.root.overrideredirect(True)', source)
+        self.assertIn('highlightthickness=0', source)
+        self.assertIn('borderwidth=0', source)
+        self.assertIn('TOKENWATCHER_WINDOW_GEOMETRY', source)
+
     def test_growth_animation_and_delta_keep_green_accent(self) -> None:
         source = MODULE_PATH.read_text(encoding="utf-8")
         self.assertGreaterEqual(source.count('fill="#20D878"'), 4)

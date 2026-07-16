@@ -75,6 +75,12 @@ SRGB_TO_LINEAR_255 = tuple(
     for value in range(256)
 )
 CONTRAST_THRESHOLD_255 = round(0.179 * 255)
+WINDOW_WIDTH = 860
+WINDOW_HEIGHT = 260
+ROW_HEIGHT = 56
+ROW_MIDDLE = ROW_HEIGHT // 2
+BODY_FONT_SIZE = 26
+TITLE_FONT_SIZE = 28
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -1804,13 +1810,13 @@ class FloatingRankRow:
     def __init__(self, parent: tk.Widget, rank: int, transparent: str):
         self.frame = tk.Frame(parent, bg=transparent)
         self.frame.pack(fill="x", pady=1)
-        self.frame.grid_columnconfigure(4, minsize=122)
-        self.frame.grid_columnconfigure(5, minsize=215, weight=1)
+        self.frame.grid_columnconfigure(4, minsize=140)
+        self.frame.grid_columnconfigure(5, minsize=250, weight=1)
         self.rank_canvas = tk.Canvas(
             self.frame,
             bg=transparent,
-            width=26,
-            height=44,
+            width=34,
+            height=ROW_HEIGHT,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -1819,32 +1825,32 @@ class FloatingRankRow:
             self.rank_canvas,
             text=str(rank),
             font_name=CASCADIA_MONO_FONT,
-            font_size=20,
-            position=(2, 22),
+            font_size=TITLE_FONT_SIZE,
+            position=(2, ROW_MIDDLE),
             anchor="lm",
         )
         self.platform_canvas = tk.Canvas(
             self.frame,
             bg="#4C8DFF",
-            width=74,
-            height=34,
+            width=92,
+            height=44,
             highlightthickness=0,
             borderwidth=0,
         )
         self.platform_canvas.grid(row=0, column=1, sticky="w")
         self.platform_text_id = self.platform_canvas.create_text(
-            37,
-            17,
+            46,
+            22,
             text="平台",
-            font=("Microsoft YaHei UI", 7, "bold"),
+            font=("Microsoft YaHei UI", 11, "bold"),
             fill="#FFFFFF",
             anchor="center",
         )
         self.model_canvas = tk.Canvas(
             self.frame,
             bg=transparent,
-            width=125,
-            height=44,
+            width=155,
+            height=ROW_HEIGHT,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -1853,14 +1859,14 @@ class FloatingRankRow:
             self.model_canvas,
             text="等待数据",
             font_name=YAHEI_BOLD_FONT,
-            font_size=18,
-            position=(2, 22),
+            font_size=BODY_FONT_SIZE,
+            position=(2, ROW_MIDDLE),
             anchor="lm",
         )
         self.call_canvas = tk.Canvas(
             self.frame,
-            width=105,
-            height=44,
+            width=120,
+            height=ROW_HEIGHT,
             bg=transparent,
             highlightthickness=0,
             borderwidth=0,
@@ -1870,24 +1876,24 @@ class FloatingRankRow:
             self.call_canvas,
             text="0",
             font_name=CASCADIA_MONO_FONT,
-            font_size=18,
-            position=(2, 22),
+            font_size=BODY_FONT_SIZE,
+            position=(2, ROW_MIDDLE),
             anchor="lm",
         )
         self.delta_canvas = tk.Canvas(
             self.frame,
             bg=transparent,
-            width=122,
-            height=44,
+            width=140,
+            height=ROW_HEIGHT,
             highlightthickness=0,
             borderwidth=0,
         )
         self.delta_canvas.grid(row=0, column=4, sticky="e", padx=(0, 4))
         self.delta_text_id = self.delta_canvas.create_text(
-            120,
-            22,
+            138,
+            ROW_MIDDLE,
             text="",
-            font=("Cascadia Mono", 8, "bold"),
+            font=("Cascadia Mono", 11, "bold"),
             fill="#20D878",
             anchor="e",
         )
@@ -1895,8 +1901,8 @@ class FloatingRankRow:
         self.token_canvas = tk.Canvas(
             self.frame,
             bg=transparent,
-            width=202,
-            height=44,
+            width=250,
+            height=ROW_HEIGHT,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -1905,8 +1911,8 @@ class FloatingRankRow:
             self.token_canvas,
             text="0",
             font_name=CASCADIA_MONO_FONT,
-            font_size=18,
-            position=(200, 22),
+            font_size=BODY_FONT_SIZE,
+            position=(248, ROW_MIDDLE),
             anchor="rm",
         )
         self.delta_hide_job = None
@@ -1996,10 +2002,10 @@ class FloatingRankRow:
             return
 
         new_text_id = self.token_canvas.create_text(
-            200,
-            66,
+            248,
+            ROW_MIDDLE + ROW_HEIGHT,
             text=format_tokens(value),
-            font=("Cascadia Mono", 9, "bold"),
+            font=("Cascadia Mono", 13, "bold"),
             fill="#20D878",
             anchor="e",
         )
@@ -2011,9 +2017,13 @@ class FloatingRankRow:
         def animate_step(step: int) -> None:
             progress = step / steps
             self.token_canvas.coords(
-                self.token_text.image_id, 0, -round(44 * progress)
+                self.token_text.image_id, 0, -round(ROW_HEIGHT * progress)
             )
-            self.token_canvas.coords(new_text_id, 200, 66 - round(44 * progress))
+            self.token_canvas.coords(
+                new_text_id,
+                248,
+                ROW_MIDDLE + ROW_HEIGHT - round(ROW_HEIGHT * progress),
+            )
             if step < steps:
                 job = self.frame.after(24, animate_step, step + 1)
                 self.token_animation_jobs.append(job)
@@ -2075,9 +2085,9 @@ class FloatingRankRow:
 
         new_text_id = self.call_canvas.create_text(
             2,
-            66,
+            ROW_MIDDLE + ROW_HEIGHT,
             text=format_tokens(value),
-            font=("Cascadia Mono", 9, "bold"),
+            font=("Cascadia Mono", 13, "bold"),
             fill="#20D878",
             anchor="w",
         )
@@ -2087,9 +2097,13 @@ class FloatingRankRow:
         def animate_step(step: int) -> None:
             progress = step / steps
             self.call_canvas.coords(
-                self.call_text.image_id, 0, -round(44 * progress)
+                self.call_text.image_id, 0, -round(ROW_HEIGHT * progress)
             )
-            self.call_canvas.coords(new_text_id, 2, 66 - round(44 * progress))
+            self.call_canvas.coords(
+                new_text_id,
+                2,
+                ROW_MIDDLE + ROW_HEIGHT - round(ROW_HEIGHT * progress),
+            )
             if step < steps:
                 job = self.frame.after(24, animate_step, step + 1)
                 self.call_animation_jobs.append(job)
@@ -2158,7 +2172,7 @@ class LiveUsageApp:
         self.root.title(APP_TITLE)
         self.root.overrideredirect(True)
         self.root.configure(bg=self.transparent)
-        self.root.geometry("710x218")
+        self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.root.attributes("-topmost", True)
         if os.name == "nt":
             self.root.wm_attributes("-transparentcolor", self.transparent)
@@ -2189,8 +2203,8 @@ class LiveUsageApp:
         self.title_canvas = tk.Canvas(
             header,
             bg=self.transparent,
-            width=180,
-            height=28,
+            width=230,
+            height=40,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -2199,15 +2213,15 @@ class LiveUsageApp:
             self.title_canvas,
             text="AI TOKEN TOP 3",
             font_name=CASCADIA_MONO_FONT,
-            font_size=20,
-            position=(1, 14),
+            font_size=TITLE_FONT_SIZE,
+            position=(1, 20),
             anchor="lm",
         )
         self.live_canvas = tk.Canvas(
             header,
             bg=self.transparent,
-            width=72,
-            height=28,
+            width=98,
+            height=40,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -2216,8 +2230,8 @@ class LiveUsageApp:
             self.live_canvas,
             text="AUTO ●",
             font_name=YAHEI_BOLD_FONT,
-            font_size=18,
-            position=(70, 14),
+            font_size=24,
+            position=(96, 20),
             anchor="rm",
         )
         self.period_frame = tk.Frame(header, bg=self.transparent)
@@ -2227,8 +2241,8 @@ class LiveUsageApp:
             canvas = tk.Canvas(
                 self.period_frame,
                 bg=self.transparent,
-                width=52,
-                height=28,
+                width=68,
+                height=40,
                 highlightthickness=0,
                 borderwidth=0,
                 cursor="hand2",
@@ -2238,8 +2252,8 @@ class LiveUsageApp:
                 canvas,
                 text=PERIOD_LABELS[period],
                 font_name=YAHEI_BOLD_FONT,
-                font_size=18,
-                position=(26, 14),
+                font_size=24,
+                position=(34, 20),
                 anchor="mm",
             )
             canvas.bind(
@@ -2258,8 +2272,8 @@ class LiveUsageApp:
         self.color_toggle_canvas = tk.Canvas(
             self.footer_frame,
             bg=self.transparent,
-            width=48,
-            height=24,
+            width=68,
+            height=32,
             highlightthickness=0,
             borderwidth=0,
             cursor="hand2",
@@ -2269,8 +2283,8 @@ class LiveUsageApp:
             self.color_toggle_canvas,
             text="自动",
             font_name=YAHEI_BOLD_FONT,
-            font_size=15,
-            position=(2, 12),
+            font_size=20,
+            position=(2, 16),
             anchor="lm",
         )
         self.color_toggle_canvas.bind("<Button-1>", self._toggle_foreground)
@@ -2278,8 +2292,8 @@ class LiveUsageApp:
         self.footer_canvas = tk.Canvas(
             self.footer_frame,
             bg=self.transparent,
-            width=500,
-            height=24,
+            width=760,
+            height=32,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -2288,8 +2302,8 @@ class LiveUsageApp:
             self.footer_canvas,
             text="0.5s",
             font_name=YAHEI_FONT,
-            font_size=15,
-            position=(498, 12),
+            font_size=20,
+            position=(758, 16),
             anchor="rm",
         )
         for widget in (
@@ -2322,6 +2336,10 @@ class LiveUsageApp:
 
     def _position_top_right(self) -> None:
         self.root.update_idletasks()
+        requested_geometry = os.environ.get("TOKENWATCHER_WINDOW_GEOMETRY", "").strip()
+        if re.fullmatch(r"\d+x\d+[+-]\d+[+-]\d+", requested_geometry):
+            self.root.geometry(requested_geometry)
+            return
         width = self.root.winfo_width()
         height = self.root.winfo_height()
         x = max(0, self.root.winfo_screenwidth() - width - 22)
