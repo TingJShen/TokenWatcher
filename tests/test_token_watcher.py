@@ -205,8 +205,11 @@ class TokenWatcherTests(unittest.TestCase):
 
     def test_growth_animation_and_delta_keep_green_accent(self) -> None:
         source = MODULE_PATH.read_text(encoding="utf-8")
-        self.assertGreaterEqual(source.count('fill="#20D878"'), 4)
-        self.assertIn('self.delta_text_id, fill="#20D878"', source)
+        self.assertIn('self.delta_text.solid_color = "#20D878"', source)
+        self.assertIn("def _create_incoming_text(", source)
+        self.assertIn("font_size=BODY_FONT_SIZE", source)
+        self.assertNotIn('font=("Cascadia Mono", 11, "bold")', source)
+        self.assertNotIn('font=("Cascadia Mono", 13, "bold")', source)
         self.assertIn('self.token_text.solid_color = "#20D878"', source)
         self.assertIn('self.call_text.solid_color = "#20D878"', source)
 

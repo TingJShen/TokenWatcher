@@ -1911,14 +1911,15 @@ class FloatingRankRow:
             borderwidth=0,
         )
         self.delta_canvas.grid(row=0, column=4, sticky="e", padx=(0, 4))
-        self.delta_text_id = self.delta_canvas.create_text(
-            138,
-            ROW_MIDDLE,
+        self.delta_text = AdaptiveCanvasText(
+            self.delta_canvas,
             text="",
-            font=("Cascadia Mono", 11, "bold"),
-            fill="#20D878",
-            anchor="e",
+            font_name=CASCADIA_MONO_FONT,
+            font_size=BODY_FONT_SIZE,
+            position=(138, ROW_MIDDLE),
+            anchor="rm",
         )
+        self.delta_text.solid_color = "#20D878"
 
         self.token_canvas = tk.Canvas(
             self.frame,
@@ -1940,13 +1941,13 @@ class FloatingRankRow:
         self.delta_hide_job = None
         self.call_color_job = None
         self.call_animation_jobs = []
-        self.call_incoming_text_id = None
+        self.call_incoming_text = None
         self.call_value = 0
         self.call_foreground = None
         self.model_foreground = None
         self.token_color_job = None
         self.token_animation_jobs = []
-        self.token_incoming_text_id = None
+        self.token_incoming_text = None
         self.token_value = 0
         self.token_foreground = None
         self.current_key: tuple[str, str] | None = None
@@ -1987,6 +1988,28 @@ class FloatingRankRow:
         if delta > 0:
             self._show_delta(delta)
 
+    @staticmethod
+    def _create_incoming_text(
+        canvas: tk.Canvas,
+        reference: AdaptiveCanvasText,
+        text: str,
+        position: tuple[int, int],
+        anchor: str,
+    ) -> AdaptiveCanvasText:
+        incoming = AdaptiveCanvasText(
+            canvas,
+            text=text,
+            font_name=CASCADIA_MONO_FONT,
+            font_size=BODY_FONT_SIZE,
+            position=position,
+            anchor=anchor,
+        )
+        incoming.solid_color = "#20D878"
+        if reference.last_background is not None and reference.last_root is not None:
+            incoming.render(reference.last_background, reference.last_root)
+        canvas.coords(incoming.image_id, 0, ROW_HEIGHT)
+        return incoming
+
     def _cancel_token_animation(self) -> None:
         for job in self.token_animation_jobs:
             try:
@@ -1994,9 +2017,9 @@ class FloatingRankRow:
             except tk.TclError:
                 pass
         self.token_animation_jobs.clear()
-        if self.token_incoming_text_id is not None:
-            self.token_canvas.delete(self.token_incoming_text_id)
-            self.token_incoming_text_id = None
+        if self.token_incoming_text is not None:
+            self.token_canvas.delete(self.token_incoming_text.image_id)
+            self.token_incoming_text = None
         self.token_canvas.coords(self.token_text.image_id, 0, 0)
         self.token_text.render_cached()
 
@@ -2023,15 +2046,14 @@ class FloatingRankRow:
             self.model_text.render_cached()
             return
 
-        new_text_id = self.token_canvas.create_text(
-            248,
-            ROW_MIDDLE + ROW_HEIGHT,
-            text=format_tokens(value),
-            font=("Cascadia Mono", 13, "bold"),
-            fill="#20D878",
-            anchor="e",
+        incoming_text = self._create_incoming_text(
+            self.token_canvas,
+            self.token_text,
+            format_tokens(value),
+            (248, ROW_MIDDLE),
+            "rm",
         )
-        self.token_incoming_text_id = new_text_id
+        self.token_incoming_text = incoming_text
         self.model_text.solid_color = "#20D878"
         self.model_text.render_cached()
         steps = 9
@@ -2042,17 +2064,17 @@ class FloatingRankRow:
                 self.token_text.image_id, 0, -round(ROW_HEIGHT * progress)
             )
             self.token_canvas.coords(
-                new_text_id,
-                248,
-                ROW_MIDDLE + ROW_HEIGHT - round(ROW_HEIGHT * progress),
+                incoming_text.image_id,
+                0,
+                ROW_HEIGHT - round(ROW_HEIGHT * progress),
             )
             if step < steps:
                 job = self.frame.after(24, animate_step, step + 1)
                 self.token_animation_jobs.append(job)
                 return
             self.token_canvas.coords(self.token_text.image_id, 0, 0)
-            self.token_canvas.delete(new_text_id)
-            self.token_incoming_text_id = None
+            self.token_canvas.delete(incoming_text.image_id)
+            self.token_incoming_text = None
             self.token_value = value
             self.token_animation_jobs.clear()
             self.token_text.solid_color = "#20D878"
@@ -2062,9 +2084,9 @@ class FloatingRankRow:
         animate_step(1)
 
     def _restore_token_color(self) -> None:
-        if self.token_incoming_text_id is not None:
-            self.token_canvas.delete(self.token_incoming_text_id)
-            self.token_incoming_text_id = None
+        if self.token_incoming_text is not None:
+            self.token_canvas.delete(self.token_incoming_text.image_id)
+            self.token_incoming_text = None
         self.token_text.solid_color = self.token_foreground
         self.token_text.set_text(format_tokens(self.token_value))
         self.model_text.solid_color = self.model_foreground
@@ -2078,9 +2100,9 @@ class FloatingRankRow:
             except tk.TclError:
                 pass
         self.call_animation_jobs.clear()
-        if self.call_incoming_text_id is not None:
-            self.call_canvas.delete(self.call_incoming_text_id)
-            self.call_incoming_text_id = None
+        if self.call_incoming_text is not None:
+            self.call_canvas.delete(self.call_incoming_text.image_id)
+            self.call_incoming_text = None
         self.call_canvas.coords(self.call_text.image_id, 0, 0)
         self.call_text.render_cached()
 
@@ -2105,15 +2127,14 @@ class FloatingRankRow:
             self.call_text.set_text(format_tokens(value))
             return
 
-        new_text_id = self.call_canvas.create_text(
-            2,
-            ROW_MIDDLE + ROW_HEIGHT,
-            text=format_tokens(value),
-            font=("Cascadia Mono", 13, "bold"),
-            fill="#20D878",
-            anchor="w",
+        incoming_text = self._create_incoming_text(
+            self.call_canvas,
+            self.call_text,
+            format_tokens(value),
+            (2, ROW_MIDDLE),
+            "lm",
         )
-        self.call_incoming_text_id = new_text_id
+        self.call_incoming_text = incoming_text
         steps = 9
 
         def animate_step(step: int) -> None:
@@ -2122,17 +2143,17 @@ class FloatingRankRow:
                 self.call_text.image_id, 0, -round(ROW_HEIGHT * progress)
             )
             self.call_canvas.coords(
-                new_text_id,
-                2,
-                ROW_MIDDLE + ROW_HEIGHT - round(ROW_HEIGHT * progress),
+                incoming_text.image_id,
+                0,
+                ROW_HEIGHT - round(ROW_HEIGHT * progress),
             )
             if step < steps:
                 job = self.frame.after(24, animate_step, step + 1)
                 self.call_animation_jobs.append(job)
                 return
             self.call_canvas.coords(self.call_text.image_id, 0, 0)
-            self.call_canvas.delete(new_text_id)
-            self.call_incoming_text_id = None
+            self.call_canvas.delete(incoming_text.image_id)
+            self.call_incoming_text = None
             self.call_value = value
             self.call_animation_jobs.clear()
             self.call_text.solid_color = "#20D878"
@@ -2142,9 +2163,9 @@ class FloatingRankRow:
         animate_step(1)
 
     def _restore_call_color(self) -> None:
-        if self.call_incoming_text_id is not None:
-            self.call_canvas.delete(self.call_incoming_text_id)
-            self.call_incoming_text_id = None
+        if self.call_incoming_text is not None:
+            self.call_canvas.delete(self.call_incoming_text.image_id)
+            self.call_incoming_text = None
         self.call_text.solid_color = self.call_foreground
         self.call_text.set_text(format_tokens(self.call_value))
         self.call_color_job = None
@@ -2152,15 +2173,11 @@ class FloatingRankRow:
     def _show_delta(self, delta: int) -> None:
         if self.delta_hide_job is not None:
             self.frame.after_cancel(self.delta_hide_job)
-        self.delta_canvas.itemconfigure(
-            self.delta_text_id,
-            text=f"+{delta:,}",
-            fill="#20D878",
-        )
+        self.delta_text.set_text(f"+{delta:,}")
         self.delta_hide_job = self.frame.after(1600, self._clear_delta)
 
     def _clear_delta(self) -> None:
-        self.delta_canvas.itemconfigure(self.delta_text_id, text="")
+        self.delta_text.set_text("")
         self.delta_hide_job = None
 
     def set_foreground(self, foreground: str) -> None:
@@ -2173,10 +2190,17 @@ class FloatingRankRow:
         for text in (self.rank_text, self.model_text, self.call_text, self.token_text):
             text.solid_color = color
             text.render_cached()
-        self.delta_canvas.itemconfigure(self.delta_text_id, fill="#20D878")
+        self.delta_text.solid_color = "#20D878"
+        self.delta_text.render_cached()
 
     def adaptive_texts(self) -> tuple[AdaptiveCanvasText, ...]:
-        return self.rank_text, self.model_text, self.call_text, self.token_text
+        return (
+            self.rank_text,
+            self.model_text,
+            self.call_text,
+            self.delta_text,
+            self.token_text,
+        )
 
 class LiveUsageApp:
     def __init__(self, engine: UsageEngine, screenshot_path: Path | None = None):
@@ -2582,7 +2606,6 @@ class LiveUsageApp:
             YAHEI_BOLD_FONT,
             PLATFORM_BADGE_FONT_SIZE,
         )
-        delta_font = _load_image_font(CASCADIA_MONO_FONT, 22)
         for card in self.cards:
             canvas = card.platform_canvas
             x = canvas.winfo_rootx() - self.root.winfo_rootx()
@@ -2601,21 +2624,6 @@ class LiveUsageApp:
                 anchor="mm",
             )
 
-            delta = str(card.delta_canvas.itemcget(card.delta_text_id, "text"))
-            if delta:
-                delta_x = (
-                    card.delta_canvas.winfo_rootx() - self.root.winfo_rootx()
-                )
-                delta_y = (
-                    card.delta_canvas.winfo_rooty() - self.root.winfo_rooty()
-                )
-                draw.text(
-                    (delta_x + 138, delta_y + ROW_MIDDLE),
-                    delta,
-                    font=delta_font,
-                    fill="#20D878",
-                    anchor="rm",
-                )
         return image.convert("RGB")
 
     def close(self) -> None:
