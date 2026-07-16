@@ -122,20 +122,34 @@ class TokenWatcherTests(unittest.TestCase):
         self.assertIn((0, 0, 0), colors)
         self.assertIn((255, 255, 255), colors)
 
-    def test_pixel_contrast_uses_linear_rgb_on_colorful_backgrounds(self) -> None:
+    def test_pixel_contrast_uses_exact_rgb_inverse_on_colorful_backgrounds(self) -> None:
         from PIL import Image
 
-        background = Image.new("RGB", (3, 1))
-        background.putdata([(255, 0, 0), (0, 0, 255), (255, 0, 255)])
+        background = Image.new("RGB", (5, 1))
+        background.putdata(
+            [(255, 0, 0), (0, 255, 0), (0, 0, 255), (80, 120, 200), (0, 0, 0)]
+        )
         colors = list(token_watcher.pixel_contrast_colors(background).getdata())
         self.assertEqual(
             colors,
             [
-                (0, 0, 0, 255),
+                (0, 255, 255, 255),
+                (255, 0, 255, 255),
+                (255, 255, 0, 255),
+                (175, 135, 55, 255),
                 (255, 255, 255, 255),
-                (0, 0, 0, 255),
             ],
         )
+
+    def test_adaptive_refresh_replaces_prepared_layers_without_hiding(self) -> None:
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        method = source.split(
+            "    def _apply_adaptive_foregrounds(self) -> None:", 1
+        )[1].split("\n    def ", 1)[0]
+        self.assertNotIn(".hide()", method)
+        self.assertIn("prepared =", method)
+        self.assertIn("buffered =", method)
+        self.assertIn("apply_buffered", method)
 
     def test_white_background_renders_crisp_opaque_black_text(self) -> None:
         from PIL import Image

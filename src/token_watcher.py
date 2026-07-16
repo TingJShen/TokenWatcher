@@ -64,18 +64,6 @@ WINDOWS_FONTS = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
 CASCADIA_MONO_FONT = str(WINDOWS_FONTS / "CascadiaMono.ttf")
 YAHEI_FONT = str(WINDOWS_FONTS / "msyh.ttc")
 YAHEI_BOLD_FONT = str(WINDOWS_FONTS / "msyhbd.ttc")
-SRGB_TO_LINEAR_255 = tuple(
-    round(
-        (
-            (value / 255.0) / 12.92
-            if value / 255.0 <= 0.04045
-            else (((value / 255.0) + 0.055) / 1.055) ** 2.4
-        )
-        * 255
-    )
-    for value in range(256)
-)
-CONTRAST_THRESHOLD_255 = round(0.179 * 255)
 WINDOW_WIDTH = 860
 WINDOW_HEIGHT = 260
 ROW_HEIGHT = 56
@@ -121,31 +109,14 @@ def choose_text_foreground(
 
 
 def contrast_color(pixel: tuple[int, int, int]) -> tuple[int, int, int, int]:
-    return (0, 0, 0, 255) if _relative_luminance(pixel) >= 0.179 else (
-        255,
-        255,
-        255,
-        255,
-    )
+    red, green, blue = pixel
+    return 255 - red, 255 - green, 255 - blue, 255
 
 
 def pixel_contrast_colors(background):
-    from PIL import Image
+    from PIL import ImageOps
 
-    red, green, blue = background.convert("RGB").split()
-    linear_rgb = Image.merge(
-        "RGB",
-        (
-            red.point(SRGB_TO_LINEAR_255),
-            green.point(SRGB_TO_LINEAR_255),
-            blue.point(SRGB_TO_LINEAR_255),
-        ),
-    )
-    luminance = linear_rgb.convert("L", (0.2126, 0.7152, 0.0722, 0))
-    contrast_lookup = [
-        255 if value < CONTRAST_THRESHOLD_255 else 0 for value in range(256)
-    ]
-    return luminance.point(contrast_lookup).convert("RGBA")
+    return ImageOps.invert(background.convert("RGB")).convert("RGBA")
 
 
 def render_pixel_contrast_text(
@@ -213,15 +184,13 @@ class AdaptiveCanvasText:
     def hide(self) -> None:
         self.canvas.itemconfigure(self.image_id, state="hidden")
 
-    def render(self, background, root: tk.Tk) -> None:
-        from PIL import ImageTk
-
+    def prepare(self, background, root: tk.Tk):
         width = max(1, self.canvas.winfo_width())
         height = max(1, self.canvas.winfo_height())
         x = self.canvas.winfo_rootx() - root.winfo_rootx()
         y = self.canvas.winfo_rooty() - root.winfo_rooty()
         crop = background.crop((x, y, x + width, y + height))
-        image = render_pixel_contrast_text(
+        return render_pixel_contrast_text(
             crop,
             self.text,
             self.font_name,
@@ -230,15 +199,39 @@ class AdaptiveCanvasText:
             self.anchor,
             self.solid_color,
         )
+
+    def apply_prepared(self, image, background, root: tk.Tk) -> None:
+        from PIL import ImageTk
+
+        new_photo = ImageTk.PhotoImage(image)
+        previous_photo = self.photo
         self.last_image = image
-        self.photo = ImageTk.PhotoImage(image)
         self.canvas.itemconfigure(
             self.image_id,
-            image=self.photo,
+            image=new_photo,
             state="normal",
         )
+        self.photo = new_photo
         self.last_background = background
         self.last_root = root
+        del previous_photo
+
+    def prepare_photo(self, image):
+        from PIL import ImageTk
+
+        return ImageTk.PhotoImage(image)
+
+    def apply_buffered(self, image, photo, background, root: tk.Tk) -> None:
+        previous_photo = self.photo
+        self.last_image = image
+        self.canvas.itemconfigure(self.image_id, image=photo, state="normal")
+        self.photo = photo
+        self.last_background = background
+        self.last_root = root
+        del previous_photo
+
+    def render(self, background, root: tk.Tk) -> None:
+        self.apply_prepared(self.prepare(background, root), background, root)
 
     def render_cached(self) -> None:
         if self.last_background is not None and self.last_root is not None:
@@ -2421,16 +2414,17 @@ class LiveUsageApp:
 
     def _apply_adaptive_foregrounds(self) -> None:
         texts = self._adaptive_texts()
-        for text in texts:
-            text.hide()
         self.root.update_idletasks()
         image = self._capture_background()
         if image is None:
-            for text in texts:
-                text.render_cached()
             return
-        for text in texts:
-            text.render(image, self.root)
+        prepared = [(text, text.prepare(image, self.root)) for text in texts]
+        buffered = [
+            (text, rendered, text.prepare_photo(rendered))
+            for text, rendered in prepared
+        ]
+        for text, rendered, photo in buffered:
+            text.apply_buffered(rendered, photo, image, self.root)
         if self.root.state() == "withdrawn":
             self.root.deiconify()
             self.root.lift()

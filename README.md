@@ -14,8 +14,8 @@ TokenWatcher is a lightweight Windows desktop overlay that displays the three mo
 - Per-glyph-pixel background inversion, allowing one character to be partly black and partly white while the overlay remains transparent
 - Green rolling animation when a value increases
 - Transparent, always-on-top, draggable window
-- WCAG-relative-luminance contrast selection for saturated and multicolored backgrounds
-- Crisp pure-black glyphs on white and other bright backgrounds
+- Exact per-pixel RGB inversion on black, white, saturated, and multicolored backgrounds
+- Flicker-free double-buffered text-layer replacement during background updates
 - Large, borderless typography sized for high-DPI desktop displays
 - Manual black/white text toggle
 - Single-instance protection
