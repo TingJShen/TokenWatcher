@@ -186,8 +186,14 @@ class TokenWatcherTests(unittest.TestCase):
     def test_overlay_layout_uses_large_borderless_text(self) -> None:
         self.assertGreaterEqual(token_watcher.BODY_FONT_SIZE, 26)
         self.assertGreaterEqual(token_watcher.TITLE_FONT_SIZE, 28)
+        self.assertLess(
+            token_watcher.PLATFORM_BADGE_FONT_SIZE,
+            token_watcher.BODY_FONT_SIZE,
+        )
         self.assertGreaterEqual(token_watcher.ROW_HEIGHT, 56)
         source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn('-PLATFORM_BADGE_FONT_SIZE, "bold"', source)
+        self.assertIn("PLATFORM_BADGE_FONT_SIZE,\n        )", source)
         self.assertIn('self.root.overrideredirect(True)', source)
         self.assertIn('highlightthickness=0', source)
         self.assertIn('borderwidth=0', source)

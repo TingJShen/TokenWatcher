@@ -70,6 +70,7 @@ ROW_HEIGHT = 56
 ROW_MIDDLE = ROW_HEIGHT // 2
 BODY_FONT_SIZE = 26
 TITLE_FONT_SIZE = 28
+PLATFORM_BADGE_FONT_SIZE = 18
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -1863,7 +1864,7 @@ class FloatingRankRow:
             46,
             22,
             text="平台",
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=("Microsoft YaHei UI", -PLATFORM_BADGE_FONT_SIZE, "bold"),
             fill="#FFFFFF",
             anchor="center",
         )
@@ -2577,7 +2578,10 @@ class LiveUsageApp:
             image.alpha_composite(text.last_image, (x, y))
 
         draw = ImageDraw.Draw(image)
-        badge_font = _load_image_font(YAHEI_BOLD_FONT, 22)
+        badge_font = _load_image_font(
+            YAHEI_BOLD_FONT,
+            PLATFORM_BADGE_FONT_SIZE,
+        )
         delta_font = _load_image_font(CASCADIA_MONO_FONT, 22)
         for card in self.cards:
             canvas = card.platform_canvas
