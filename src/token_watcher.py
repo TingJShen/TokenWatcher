@@ -24,6 +24,9 @@ INSTANCE_MUTEX_NAME = "Local\\TokenWatcher.Singleton"
 START_DATE = date(2026, 2, 1)
 REFRESH_SECONDS = 0.5
 STARTUP_HOT_SECONDS = 300.0
+REFERENCE_FILE_CHECK_SECONDS = 5.0
+REPORT_CHECK_SECONDS = 10.0
+FINGERPRINT_COMPACT_THRESHOLD = 4096
 SHANGHAI = timezone(timedelta(hours=8))
 PERIODS = ("today", "week", "month", "cumulative")
 PERIOD_LABELS = {
@@ -57,7 +60,7 @@ CODEX_USAGE_KEYS = (
     "reasoning_output_tokens",
     "total_tokens",
 )
-CODEX_CACHE_VERSION = 2
+CODEX_CACHE_VERSION = 4
 CLAUDE_CACHE_VERSION = 1
 USAGE_SNAPSHOT_CACHE_VERSION = 3
 WINDOWS_FONTS = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
@@ -290,13 +293,13 @@ def codex_usage_fingerprint(
     )
 
 
-def codex_fingerprint_digest(fingerprint: tuple) -> str:
+def codex_fingerprint_digest(fingerprint: tuple) -> bytes:
     payload = json.dumps(
         fingerprint,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    return hashlib.blake2b(payload, digest_size=16).hexdigest()
+    return hashlib.blake2b(payload, digest_size=16).digest()
 
 
 class DirectoryChangeWatcher:
@@ -398,7 +401,8 @@ class DirectoryChangeWatcher:
                 break
             length = int(bytes_returned.value)
             if not length:
-                continue
+                self.available = False
+                break
             offset = 0
             while offset < length:
                 next_offset, _action, name_bytes = struct.unpack_from(
@@ -674,12 +678,14 @@ class CodexTailTracker:
         self.states: dict[Path, CodexFileState] = {}
         self.periods = empty_periods()
         self.call_periods = empty_periods()
-        self.seen: set[str] = set()
+        self.seen_packed = b""
+        self.seen: set[bytes] = set()
         self.cached_files: dict[str, dict] = {}
         self.cache_dirty = False
         self.last_event: datetime | None = None
         self.errors = 0
         self.cache_errors = 0
+        self.next_fallback_check = 0.0
         self._load_cache()
         self._discover_startup()
 
@@ -694,17 +700,28 @@ class CodexTailTracker:
                 SHANGHAI,
             ).date()
             payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
-            if int(payload.get("version") or 0) != CODEX_CACHE_VERSION:
+            version = int(payload.get("version") or 0)
+            if version not in (2, 3, CODEX_CACHE_VERSION):
                 return
-            fingerprints = payload.get("fingerprints") or []
             files = payload.get("files") or {}
-            if not isinstance(fingerprints, list) or not isinstance(files, dict):
+            if not isinstance(files, dict):
                 return
-            self.seen = {
-                value
-                for value in fingerprints
-                if isinstance(value, str) and len(value) == 32
-            }
+            if version == 2:
+                fingerprints = payload.get("fingerprints") or []
+                if not isinstance(fingerprints, list):
+                    return
+                legacy_seen = {
+                    bytes.fromhex(value)
+                    for value in fingerprints
+                    if isinstance(value, str) and len(value) == 32
+                }
+                self.seen_packed = b"".join(sorted(legacy_seen))
+            else:
+                encoded = str(payload.get("fingerprints_b64") or "")
+                packed = base64.b64decode(encoded.encode("ascii")) if encoded else b""
+                if len(packed) % 16:
+                    raise ValueError("invalid packed Codex fingerprints")
+                self.seen_packed = packed
             self.cached_files = {
                 str(key): value
                 for key, value in files.items()
@@ -738,6 +755,10 @@ class CodexTailTracker:
                     else None
                 )
             else:
+                self.seen_packed = b""
+                self.seen.clear()
+                self.cache_dirty = True
+            if version != CODEX_CACHE_VERSION:
                 self.cache_dirty = True
         except FileNotFoundError:
             return
@@ -747,12 +768,15 @@ class CodexTailTracker:
     def _save_cache(self) -> None:
         if not self.cache_dirty:
             return
+        self._compact_fingerprints()
         payload = {
             "version": CODEX_CACHE_VERSION,
             "updated_at": datetime.now(SHANGHAI).isoformat(),
             "period_date": datetime.now(SHANGHAI).date().isoformat(),
             "since": self.since.isoformat(),
-            "fingerprints": sorted(self.seen),
+            "fingerprints_b64": base64.b64encode(
+                self.seen_packed
+            ).decode("ascii"),
             "files": self.cached_files,
             "periods": ClaudeTailTracker._encode_periods(self.periods),
             "call_periods": ClaudeTailTracker._encode_periods(self.call_periods),
@@ -773,6 +797,36 @@ class CodexTailTracker:
                 temporary_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def _has_fingerprint(self, fingerprint: bytes) -> bool:
+        if fingerprint in self.seen:
+            return True
+        low = 0
+        high = len(self.seen_packed) // 16
+        while low < high:
+            middle = (low + high) // 2
+            value = self.seen_packed[middle * 16 : (middle + 1) * 16]
+            if value < fingerprint:
+                low = middle + 1
+            else:
+                high = middle
+        return (
+            low < len(self.seen_packed) // 16
+            and self.seen_packed[low * 16 : (low + 1) * 16] == fingerprint
+        )
+
+    def _compact_fingerprints(self) -> None:
+        if not self.seen:
+            return
+        existing = [
+            self.seen_packed[index : index + 16]
+            for index in range(0, len(self.seen_packed), 16)
+        ]
+        self.seen_packed = b"".join(sorted(set(existing) | self.seen))
+        self.seen.clear()
+
+    def fingerprint_count(self) -> int:
+        return len(self.seen_packed) // 16 + len(self.seen)
 
     def _state_from_cache(
         self,
@@ -865,10 +919,12 @@ class CodexTailTracker:
             self._read_path(path, state, initial=True)
         self._save_cache()
 
-    def _discover_changes(self) -> None:
+    def _discover_changes(self) -> set[Path]:
+        changed: set[Path] = set()
         for path in self.watcher.drain():
             if path.suffix.lower() != ".jsonl":
                 continue
+            changed.add(path)
             state = self.states.get(path)
             if state is None:
                 try:
@@ -884,6 +940,7 @@ class CodexTailTracker:
             state.watching = True
             state.stop_after_initial = False
             state.next_check = 0.0
+        return changed
 
     def _consume(self, data: bytes, state: CodexFileState, initial: bool) -> None:
         data = state.remainder + data
@@ -925,9 +982,11 @@ class CodexTailTracker:
                     info,
                 )
             )
-            if fingerprint in self.seen:
+            if self._has_fingerprint(fingerprint):
                 continue
             self.seen.add(fingerprint)
+            if len(self.seen) >= FINGERPRINT_COMPACT_THRESHOLD:
+                self._compact_fingerprints()
             self.cache_dirty = True
             try:
                 event_time = parse_time(event.get("timestamp")).astimezone(timezone.utc)
@@ -998,9 +1057,19 @@ class CodexTailTracker:
             self.errors += 1
 
     def poll(self) -> None:
-        self._discover_changes()
+        changed = self._discover_changes()
         now = time.monotonic()
-        for path, state in list(self.states.items()):
+        if self.watcher.available:
+            paths = changed
+        elif now >= self.next_fallback_check:
+            paths = set(self.states)
+            self.next_fallback_check = now + REFERENCE_FILE_CHECK_SECONDS
+        else:
+            paths = set()
+        for path in paths:
+            state = self.states.get(path)
+            if state is None:
+                continue
             self._read_path(path, state, now=now)
 
     def close(self) -> None:
@@ -1055,14 +1124,23 @@ class ClaudeUsageCache:
         self.last_signature: tuple[float, int] | None = None
         self.cached: tuple[dict[str, Counter], str, datetime] | None = None
         self.period_date: date | None = None
+        self.next_check = 0.0
 
     def read(self) -> tuple[dict[str, Counter], str, datetime]:
+        now = time.monotonic()
+        current_date = datetime.now(SHANGHAI).date()
+        if (
+            self.cached is not None
+            and current_date == self.period_date
+            and now < self.next_check
+        ):
+            return self.cached
+        self.next_check = now + REFERENCE_FILE_CHECK_SECONDS
         try:
             stat = self.stats_path.stat()
             signature = (stat.st_mtime, stat.st_size)
         except OSError:
             signature = (0.0, 0)
-        current_date = datetime.now(SHANGHAI).date()
         if (
             self.cached is None
             or signature != self.last_signature
@@ -1113,6 +1191,7 @@ class ClaudeTailTracker:
         self.last_event: datetime | None = None
         self.errors = 0
         self.cache_errors = 0
+        self.next_fallback_check = 0.0
         self._load_cache()
         self._discover_startup()
         self._save_cache()
@@ -1280,10 +1359,12 @@ class ClaudeTailTracker:
                     state.remainder = b""
             self._read_path(path, state, initial=True)
 
-    def _discover_changes(self) -> None:
+    def _discover_changes(self) -> set[Path]:
+        changed: set[Path] = set()
         for path in self.watcher.drain():
             if path.suffix.lower() != ".jsonl":
                 continue
+            changed.add(path)
             state = self.states.get(path)
             if state is None:
                 state = ClaudeFileState()
@@ -1291,6 +1372,7 @@ class ClaudeTailTracker:
             state.watching = True
             state.stop_after_initial = False
             state.next_check = 0.0
+        return changed
 
     def _consume(self, data: bytes, state: ClaudeFileState) -> None:
         data = state.remainder + data
@@ -1383,9 +1465,19 @@ class ClaudeTailTracker:
             self.errors += 1
 
     def poll(self) -> None:
-        self._discover_changes()
+        changed = self._discover_changes()
         now = time.monotonic()
-        for path, state in list(self.states.items()):
+        if self.watcher.available:
+            paths = changed
+        elif now >= self.next_fallback_check:
+            paths = set(self.states)
+            self.next_fallback_check = now + REFERENCE_FILE_CHECK_SECONDS
+        else:
+            paths = set()
+        for path in paths:
+            state = self.states.get(path)
+            if state is None:
+                continue
             self._read_path(path, state, now=now)
 
     def close(self) -> None:
@@ -1415,8 +1507,13 @@ class ClineTaskCache:
     def __init__(self):
         self.last_signature: tuple[float, int] | None = None
         self.cached: dict[str, tuple[str, int, datetime]] = {}
+        self.next_check = 0.0
 
-    def read(self) -> dict[str, tuple[str, int, datetime]]:
+    def read(self, force: bool = False) -> dict[str, tuple[str, int, datetime]]:
+        now = time.monotonic()
+        if not force and now < self.next_check:
+            return dict(self.cached)
+        self.next_check = now + REFERENCE_FILE_CHECK_SECONDS
         try:
             stat = CLINE_HISTORY.stat()
             signature = (stat.st_mtime, stat.st_size)
@@ -1441,6 +1538,7 @@ class ClineRequestCounter:
         self.known_paths: set[Path] = set()
         self.initialized = False
         self.periods = empty_periods()
+        self.next_fallback_check = 0.0
 
     def _parse_path(self, path: Path, fallback_model: str) -> dict[str, Counter]:
         periods = empty_periods()
@@ -1481,6 +1579,13 @@ class ClineRequestCounter:
             self.states[path] = (signature, self._parse_path(path, fallback_model))
 
     def poll(self, tasks: dict[str, tuple[str, int, datetime]]) -> None:
+        self.poll_changes(tasks, None)
+
+    def poll_changes(
+        self,
+        tasks: dict[str, tuple[str, int, datetime]],
+        changes: set[Path] | None,
+    ) -> None:
         models_by_path: dict[Path, str] = {}
         timestamps_by_path: dict[Path, datetime] = {}
         for task_id, (model, _total, timestamp) in tasks.items():
@@ -1492,13 +1597,16 @@ class ClineRequestCounter:
             candidates = set(active_paths)
             self.initialized = True
         else:
+            changed_paths = self.watcher.drain() if changes is None else changes
             candidates = {
                 path
-                for path in self.watcher.drain()
+                for path in changed_paths
                 if path.name.lower() == "ui_messages.json" and path in active_paths
             }
             candidates.update(active_paths - self.known_paths)
-            if not self.watcher.available:
+            now = time.monotonic()
+            if not self.watcher.available and now >= self.next_fallback_check:
+                self.next_fallback_check = now + REFERENCE_FILE_CHECK_SECONDS
                 hot_boundary = datetime.now(SHANGHAI) - timedelta(
                     seconds=STARTUP_HOT_SECONDS
                 )
@@ -1552,7 +1660,7 @@ class ClinePoller:
         }
         self.report_time = baseline.refreshed_at.astimezone(SHANGHAI)
         self.task_cache = ClineTaskCache()
-        self.initial_tasks = self.task_cache.read()
+        self.initial_tasks = self.task_cache.read(force=True)
         initial_by_model = Counter()
         for model, total, _ in self.initial_tasks.values():
             initial_by_model[("Cline", model)] += total
@@ -1574,8 +1682,12 @@ class ClinePoller:
         self.poll()
 
     def poll(self) -> None:
-        current_tasks = self.task_cache.read()
-        self.request_counter.poll(current_tasks)
+        changes = self.request_counter.watcher.drain()
+        history_changed = CLINE_HISTORY in changes
+        current_tasks = self.task_cache.read(
+            force=history_changed
+        )
+        self.request_counter.poll_changes(current_tasks, changes)
         current_by_model = Counter()
         delta_periods = empty_periods()
         for task_id, (model, total, timestamp) in current_tasks.items():
@@ -1622,7 +1734,7 @@ class ClinePoller:
         rollover_periods(self.periods, previous_date, current_date)
         rollover_periods(self.call_periods, previous_date, current_date)
         self.request_counter.roll_periods(previous_date, current_date)
-        current_tasks = self.task_cache.read()
+        current_tasks = self.task_cache.read(force=True)
         current_by_model = Counter()
         for model, total, _timestamp in current_tasks.values():
             current_by_model[("Cline", model)] += total
@@ -1740,6 +1852,7 @@ class UsageEngine:
         self.claude_boundary: datetime | None = None
         self.cline: ClinePoller | None = None
         self.period_date = datetime.now(SHANGHAI).date()
+        self.next_report_check = 0.0
         self._load_snapshot_cache()
         if self.snapshot is None:
             self._load_report_preview()
@@ -1889,7 +2002,15 @@ class UsageEngine:
         try:
             current_date = datetime.now(SHANGHAI).date()
             summary_path = self.report_dir / "summary.json"
-            current_mtime = summary_path.stat().st_mtime if summary_path.exists() else 0.0
+            now = time.monotonic()
+            if self.baseline is None or now >= self.next_report_check:
+                try:
+                    current_mtime = summary_path.stat().st_mtime
+                except OSError:
+                    current_mtime = 0.0
+                self.next_report_check = now + REPORT_CHECK_SECONDS
+            else:
+                current_mtime = self.baseline.report_mtime
             if self.baseline is None or current_mtime != self.baseline.report_mtime:
                 self._reload()
                 self.period_date = current_date
@@ -1946,7 +2067,7 @@ class UsageEngine:
                 updated_at=datetime.now(SHANGHAI),
                 report_time=self.baseline.refreshed_at.astimezone(SHANGHAI),
                 source_status=(
-                    f"Codex 增量事件：{len(self.codex.seen)}，最新 {last_event}",
+                    f"Codex 增量事件：{self.codex.fingerprint_count()}，最新 {last_event}",
                     f"{claude_status}，尾读 {len(self.claude.seen)} 条，最新 {claude_last_event}",
                     self.cline.status,
                 ),

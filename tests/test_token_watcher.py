@@ -488,7 +488,6 @@ class TokenWatcherTests(unittest.TestCase):
 
             self.assertFalse(tracker.states[cold].watching)
             self.assertTrue(tracker.states[hot].watching)
-            tracker.states[hot].next_check = 0
             original_stat = token_watcher.Path.stat
             touched: list[Path] = []
 
@@ -501,7 +500,7 @@ class TokenWatcherTests(unittest.TestCase):
             ):
                 tracker.poll()
             self.assertNotIn(cold, touched)
-            self.assertIn(hot, touched)
+            self.assertNotIn(hot, touched)
 
             with cold.open("a", encoding="utf-8") as handle:
                 handle.write(self._codex_lines("cold", 20, now + timedelta(seconds=1)))
@@ -758,8 +757,119 @@ class TokenWatcherTests(unittest.TestCase):
                     cache_path=cache_path,
                 )
             self.assertFalse(second.periods["cumulative"])
+            self.assertFalse(second.seen_packed)
+            self.assertFalse(second.seen)
             self.assertEqual(second.states[log_path].offset, log_path.stat().st_size)
             second.close()
+
+    def test_codex_fingerprints_are_compact_binary_values(self) -> None:
+        digest = token_watcher.codex_fingerprint_digest(("session", 123))
+        self.assertIsInstance(digest, bytes)
+        self.assertEqual(len(digest), 16)
+
+    def test_legacy_codex_fingerprints_and_offsets_survive_format_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            session_dir = home / ".codex" / "sessions" / "2026" / "07" / "18"
+            session_dir.mkdir(parents=True)
+            cache_path = home / ".tokenwatcher" / "codex_fingerprint_cache.json"
+            now = datetime.now(timezone.utc)
+            path = session_dir / "session.jsonl"
+            path.write_text(self._codex_lines("legacy", 1, now), encoding="utf-8")
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                first = token_watcher.CodexTailTracker(
+                    now - timedelta(days=1),
+                    watcher=FakeWatcher(),
+                    cache_path=cache_path,
+                )
+            first.close()
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            payload["version"] = token_watcher.CODEX_CACHE_VERSION - 1
+            payload["fingerprints_b64"] = "AAECAwQFBgcICQoLDA0ODw=="
+            cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            original_open = token_watcher.Path.open
+
+            def guarded_open(target: Path, *args, **kwargs):
+                if target.suffix.lower() == ".jsonl":
+                    raise AssertionError(f"unexpected legacy JSONL read: {target}")
+                return original_open(target, *args, **kwargs)
+
+            with patch.object(token_watcher.Path, "home", return_value=home), patch.object(
+                token_watcher.Path, "open", guarded_open
+            ):
+                second = token_watcher.CodexTailTracker(
+                    now - timedelta(days=1),
+                    watcher=FakeWatcher(),
+                    cache_path=cache_path,
+                )
+            self.assertEqual(second.fingerprint_count(), 1)
+            self.assertEqual(second.states[path].offset, path.stat().st_size)
+            second.close()
+
+    def test_compact_codex_fingerprint_store_keeps_exact_membership(self) -> None:
+        tracker = object.__new__(token_watcher.CodexTailTracker)
+        tracker.seen_packed = b""
+        tracker.seen = {
+            bytes([index]) * 16 for index in range(32)
+        }
+        tracker._compact_fingerprints()
+        self.assertFalse(tracker.seen)
+        self.assertEqual(tracker.fingerprint_count(), 32)
+        for index in range(32):
+            self.assertTrue(tracker._has_fingerprint(bytes([index]) * 16))
+        self.assertFalse(tracker._has_fingerprint(b"x" * 16))
+
+    def test_codex_fallback_poll_is_throttled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            session_dir = home / ".codex" / "sessions" / "2026" / "07" / "18"
+            session_dir.mkdir(parents=True)
+            path = session_dir / "session.jsonl"
+            now = datetime.now(timezone.utc)
+            path.write_text(self._codex_lines("fallback", 1, now), encoding="utf-8")
+            watcher = FakeWatcher()
+            watcher.available = False
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                tracker = token_watcher.CodexTailTracker(
+                    now - timedelta(days=1), watcher=watcher
+                )
+            tracker.next_fallback_check = time.monotonic() + 60
+            with patch.object(
+                token_watcher.Path,
+                "stat",
+                side_effect=AssertionError("fallback poll was not throttled"),
+            ):
+                tracker.poll()
+
+    def test_reference_file_caches_do_not_stat_every_refresh(self) -> None:
+        today = datetime.now(token_watcher.SHANGHAI).date()
+        claude_cache = token_watcher.ClaudeUsageCache()
+        claude_cache.cached = (
+            token_watcher.empty_periods(),
+            "cached",
+            datetime.now(token_watcher.SHANGHAI),
+        )
+        claude_cache.period_date = today
+        claude_cache.next_check = time.monotonic() + 60
+        with patch.object(
+            token_watcher.Path,
+            "stat",
+            side_effect=AssertionError("unexpected Claude stats-cache stat"),
+        ):
+            self.assertEqual(claude_cache.read()[1], "cached")
+
+        cline_cache = token_watcher.ClineTaskCache()
+        cline_cache.cached = {
+            "task": ("cline-test", 1, datetime.now(token_watcher.SHANGHAI))
+        }
+        cline_cache.next_check = time.monotonic() + 60
+        with patch.object(
+            token_watcher.Path,
+            "stat",
+            side_effect=AssertionError("unexpected Cline taskHistory stat"),
+        ):
+            self.assertIn("task", cline_cache.read())
 
     def test_claude_runtime_changes_do_not_rescan_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -778,7 +888,12 @@ class TokenWatcherTests(unittest.TestCase):
                 )
             self.assertFalse(tracker.states[cold].watching)
             with patch.object(token_watcher.Path, "rglob", side_effect=AssertionError):
-                tracker.poll()
+                with patch.object(
+                    token_watcher.Path,
+                    "stat",
+                    side_effect=AssertionError("unexpected idle Claude stat"),
+                ):
+                    tracker.poll()
 
             new_file = project_dir / "new.jsonl"
             new_file.touch()
