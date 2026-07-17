@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -184,6 +185,7 @@ class TokenWatcherTests(unittest.TestCase):
         self.assertIn("image.alpha_composite(text.last_image", source)
 
     def test_overlay_layout_uses_large_borderless_text(self) -> None:
+        self.assertEqual(token_watcher.WINDOW_WIDTH, 720)
         self.assertGreaterEqual(token_watcher.BODY_FONT_SIZE, 26)
         self.assertGreaterEqual(token_watcher.TITLE_FONT_SIZE, 28)
         self.assertLess(
@@ -219,6 +221,40 @@ class TokenWatcherTests(unittest.TestCase):
             token_watcher.active_periods(now, now),
             ("cumulative", "month", "week", "today"),
         )
+        self.assertEqual(
+            token_watcher.active_periods(date(2026, 7, 12), now),
+            ("cumulative", "month"),
+        )
+
+    def test_midnight_rollover_clears_calendar_periods_only(self) -> None:
+        key = ("Codex", "gpt-test")
+        periods = {
+            period: Counter({key: 10}) for period in token_watcher.PERIODS
+        }
+        reset = token_watcher.rollover_periods(
+            periods,
+            date(2026, 7, 19),
+            date(2026, 7, 20),
+        )
+        self.assertEqual(reset, ("today", "week"))
+        self.assertEqual(periods["cumulative"][key], 10)
+        self.assertEqual(periods["month"][key], 10)
+        self.assertFalse(periods["week"])
+        self.assertFalse(periods["today"])
+
+    def test_month_boundary_at_midnight_clears_today_week_and_month(self) -> None:
+        key = ("Codex", "gpt-test")
+        periods = {
+            period: Counter({key: 10}) for period in token_watcher.PERIODS
+        }
+        reset = token_watcher.rollover_periods(
+            periods,
+            date(2026, 5, 31),
+            date(2026, 6, 1),
+        )
+        self.assertEqual(reset, ("today", "week", "month"))
+        self.assertEqual(periods["cumulative"][key], 10)
+        self.assertFalse(periods["month"])
 
     def test_missing_report_creates_empty_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -282,6 +318,48 @@ class TokenWatcherTests(unittest.TestCase):
                 loaded.call_periods["cumulative"][("Codex", "gpt-test")],
                 4,
             )
+
+    def test_snapshot_cache_clears_today_after_shanghai_midnight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cache_path = root / "usage_snapshot_cache.json"
+            key = ("Codex", "gpt-test")
+            today = datetime.now(token_watcher.SHANGHAI).date()
+            yesterday = today - timedelta(days=1)
+            previous = datetime.combine(
+                yesterday,
+                datetime.min.time(),
+                tzinfo=token_watcher.SHANGHAI,
+            )
+            periods = {
+                period: {key: 123} for period in token_watcher.PERIODS
+            }
+            calls = {
+                period: {key: 4} for period in token_watcher.PERIODS
+            }
+            snapshot = token_watcher.UsageSnapshot(
+                periods=periods,
+                call_periods=calls,
+                updated_at=previous,
+                report_time=previous,
+                source_status=("cached",),
+            )
+            payload = {
+                "version": token_watcher.USAGE_SNAPSHOT_CACHE_VERSION,
+                "period_date": yesterday.isoformat(),
+                "report_dir": str(root.resolve()),
+                "snapshot": token_watcher.usage_snapshot_to_json(snapshot),
+            }
+            cache_path.write_text(json.dumps(payload), encoding="utf-8")
+            reader = token_watcher.UsageEngine(
+                report_dir=root,
+                snapshot_cache_path=cache_path,
+            )
+            loaded = reader.get_snapshot()
+            assert loaded is not None
+            self.assertEqual(loaded.periods["cumulative"][key], 123)
+            self.assertFalse(loaded.periods["today"])
+            self.assertFalse(loaded.call_periods["today"])
 
     def test_report_preview_is_available_when_snapshot_cache_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

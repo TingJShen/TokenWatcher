@@ -59,18 +59,25 @@ CODEX_USAGE_KEYS = (
 )
 CODEX_CACHE_VERSION = 2
 CLAUDE_CACHE_VERSION = 1
-USAGE_SNAPSHOT_CACHE_VERSION = 2
+USAGE_SNAPSHOT_CACHE_VERSION = 3
 WINDOWS_FONTS = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
 CASCADIA_MONO_FONT = str(WINDOWS_FONTS / "CascadiaMono.ttf")
 YAHEI_FONT = str(WINDOWS_FONTS / "msyh.ttc")
 YAHEI_BOLD_FONT = str(WINDOWS_FONTS / "msyhbd.ttc")
-WINDOW_WIDTH = 860
+WINDOW_WIDTH = 720
 WINDOW_HEIGHT = 260
 ROW_HEIGHT = 56
 ROW_MIDDLE = ROW_HEIGHT // 2
 BODY_FONT_SIZE = 26
 TITLE_FONT_SIZE = 28
 PLATFORM_BADGE_FONT_SIZE = 18
+RANK_COLUMN_WIDTH = 28
+PLATFORM_COLUMN_WIDTH = 82
+MODEL_COLUMN_WIDTH = 125
+CALL_COLUMN_WIDTH = 90
+DELTA_COLUMN_WIDTH = 140
+TOKEN_COLUMN_WIDTH = 210
+FOOTER_COLUMN_WIDTH = WINDOW_WIDTH - 80
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -511,6 +518,33 @@ def empty_periods() -> dict[str, Counter]:
     return {period: Counter() for period in PERIODS}
 
 
+def rollover_periods(
+    periods: dict[str, Counter] | dict[str, dict],
+    previous_date: date,
+    current_date: date,
+) -> tuple[str, ...]:
+    if current_date <= previous_date:
+        return ()
+    reset = ["today"]
+    if previous_date.isocalendar()[:2] != current_date.isocalendar()[:2]:
+        reset.append("week")
+    if (previous_date.year, previous_date.month) != (
+        current_date.year,
+        current_date.month,
+    ):
+        reset.append("month")
+    for period in reset:
+        periods[period].clear()
+    return tuple(reset)
+
+
+def cached_period_date(payload: dict, fallback: date | None = None) -> date:
+    value = payload.get("period_date") or payload.get("updated_at")
+    if value:
+        return parse_time(str(value)).astimezone(SHANGHAI).date()
+    return fallback or datetime.now(SHANGHAI).date()
+
+
 def active_periods(event_date: date, now_date: date | None = None) -> tuple[str, ...]:
     now_date = now_date or datetime.now(SHANGHAI).date()
     periods = ["cumulative"]
@@ -655,6 +689,10 @@ class CodexTailTracker:
 
     def _load_cache(self) -> None:
         try:
+            cache_date = datetime.fromtimestamp(
+                self.cache_path.stat().st_mtime,
+                SHANGHAI,
+            ).date()
             payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
             if int(payload.get("version") or 0) != CODEX_CACHE_VERSION:
                 return
@@ -679,6 +717,20 @@ class CodexTailTracker:
                 self.call_periods = ClaudeTailTracker._decode_periods(
                     payload.get("call_periods")
                 )
+                cached_date = cached_period_date(payload, cache_date)
+                current_date = datetime.now(SHANGHAI).date()
+                reset = rollover_periods(
+                    self.periods,
+                    cached_date,
+                    current_date,
+                )
+                rollover_periods(
+                    self.call_periods,
+                    cached_date,
+                    current_date,
+                )
+                if reset:
+                    self.cache_dirty = True
                 last_event = payload.get("last_event")
                 self.last_event = (
                     parse_time(last_event).astimezone(timezone.utc)
@@ -698,6 +750,7 @@ class CodexTailTracker:
         payload = {
             "version": CODEX_CACHE_VERSION,
             "updated_at": datetime.now(SHANGHAI).isoformat(),
+            "period_date": datetime.now(SHANGHAI).date().isoformat(),
             "since": self.since.isoformat(),
             "fingerprints": sorted(self.seen),
             "files": self.cached_files,
@@ -1001,6 +1054,7 @@ class ClaudeUsageCache:
         self.stats_path = Path.home() / ".claude" / "stats-cache.json"
         self.last_signature: tuple[float, int] | None = None
         self.cached: tuple[dict[str, Counter], str, datetime] | None = None
+        self.period_date: date | None = None
 
     def read(self) -> tuple[dict[str, Counter], str, datetime]:
         try:
@@ -1008,9 +1062,15 @@ class ClaudeUsageCache:
             signature = (stat.st_mtime, stat.st_size)
         except OSError:
             signature = (0.0, 0)
-        if self.cached is None or signature != self.last_signature:
+        current_date = datetime.now(SHANGHAI).date()
+        if (
+            self.cached is None
+            or signature != self.last_signature
+            or current_date != self.period_date
+        ):
             self.cached = _parse_claude_usage(self.stats_path)
             self.last_signature = signature
+            self.period_date = current_date
         return self.cached
 
 
@@ -1082,6 +1142,10 @@ class ClaudeTailTracker:
 
     def _load_cache(self) -> None:
         try:
+            cache_date = datetime.fromtimestamp(
+                self.cache_path.stat().st_mtime,
+                SHANGHAI,
+            ).date()
             payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
             if int(payload.get("version") or 0) != CLAUDE_CACHE_VERSION:
                 return
@@ -1093,6 +1157,20 @@ class ClaudeTailTracker:
                 return
             self.periods = self._decode_periods(payload.get("periods"))
             self.call_periods = self._decode_periods(payload.get("call_periods"))
+            cached_date = cached_period_date(payload, cache_date)
+            current_date = datetime.now(SHANGHAI).date()
+            reset = rollover_periods(
+                self.periods,
+                cached_date,
+                current_date,
+            )
+            rollover_periods(
+                self.call_periods,
+                cached_date,
+                current_date,
+            )
+            if reset:
+                self.cache_dirty = True
             self.seen = {
                 tuple(str(value) for value in row)
                 for row in payload.get("seen") or []
@@ -1116,6 +1194,7 @@ class ClaudeTailTracker:
             "token_since": self.since.isoformat(),
             "call_since": self.call_since.isoformat(),
             "track_tokens": self.track_tokens,
+            "period_date": datetime.now(SHANGHAI).date().isoformat(),
             "periods": self._encode_periods(self.periods),
             "call_periods": self._encode_periods(self.call_periods),
             "seen": [list(row) for row in sorted(self.seen)],
@@ -1439,6 +1518,11 @@ class ClineRequestCounter:
                 combined[period].update(path_periods[period])
         self.periods = combined
 
+    def roll_periods(self, previous_date: date, current_date: date) -> None:
+        for _signature, path_periods in self.states.values():
+            rollover_periods(path_periods, previous_date, current_date)
+        rollover_periods(self.periods, previous_date, current_date)
+
     def close(self) -> None:
         if self._owns_watcher:
             self.watcher.close()
@@ -1523,6 +1607,30 @@ class ClinePoller:
             for period in PERIODS
         }
         self.status = f"Cline 任务：{len(current_tasks)}"
+
+    def roll_periods(self, previous_date: date, current_date: date) -> None:
+        rollover_periods(
+            self.baseline_periods,
+            previous_date,
+            current_date,
+        )
+        rollover_periods(
+            self.baseline_call_periods,
+            previous_date,
+            current_date,
+        )
+        rollover_periods(self.periods, previous_date, current_date)
+        rollover_periods(self.call_periods, previous_date, current_date)
+        self.request_counter.roll_periods(previous_date, current_date)
+        current_tasks = self.task_cache.read()
+        current_by_model = Counter()
+        for model, total, _timestamp in current_tasks.values():
+            current_by_model[("Cline", model)] += total
+        cumulative = Counter(self.periods["cumulative"])
+        self.initial_tasks = current_tasks
+        self.offsets = Counter()
+        for key in set(current_by_model) | set(cumulative):
+            self.offsets[key] = cumulative[key] - current_by_model[key]
 
 
     def close(self) -> None:
@@ -1631,6 +1739,7 @@ class UsageEngine:
         self.claude_usage = ClaudeUsageCache()
         self.claude_boundary: datetime | None = None
         self.cline: ClinePoller | None = None
+        self.period_date = datetime.now(SHANGHAI).date()
         self._load_snapshot_cache()
         if self.snapshot is None:
             self._load_report_preview()
@@ -1644,8 +1753,19 @@ class UsageEngine:
             if cached_report_dir != self.report_dir.resolve():
                 return
             snapshot = usage_snapshot_from_json(payload["snapshot"])
+            snapshot_date = date.fromisoformat(str(payload["period_date"]))
         except (OSError, ValueError, TypeError, KeyError):
             return
+        rollover_periods(
+            snapshot.periods,
+            snapshot_date,
+            self.period_date,
+        )
+        rollover_periods(
+            snapshot.call_periods,
+            snapshot_date,
+            self.period_date,
+        )
         self.snapshot = snapshot
         self.snapshot_cache_signature = usage_snapshot_signature(snapshot)
 
@@ -1678,6 +1798,7 @@ class UsageEngine:
         payload = {
             "version": USAGE_SNAPSHOT_CACHE_VERSION,
             "saved_at": datetime.now(SHANGHAI).isoformat(),
+            "period_date": self.period_date.isoformat(),
             "report_dir": str(self.report_dir.resolve()),
             "snapshot": usage_snapshot_to_json(snapshot),
         }
@@ -1719,12 +1840,61 @@ class UsageEngine:
         self.claude_boundary = claude_boundary
         self.cline = ClinePoller(self.baseline)
 
+    def _roll_periods_if_needed(self, current_date: date) -> None:
+        if current_date <= self.period_date:
+            return
+        previous_date = self.period_date
+        if self.baseline is not None:
+            rollover_periods(
+                self.baseline.periods,
+                previous_date,
+                current_date,
+            )
+            rollover_periods(
+                self.baseline.call_periods,
+                previous_date,
+                current_date,
+            )
+        for tracker in (self.codex, self.claude):
+            if tracker is None:
+                continue
+            rollover_periods(
+                tracker.periods,
+                previous_date,
+                current_date,
+            )
+            rollover_periods(
+                tracker.call_periods,
+                previous_date,
+                current_date,
+            )
+            tracker.cache_dirty = True
+        if self.cline is not None:
+            self.cline.roll_periods(previous_date, current_date)
+        snapshot = self.get_snapshot()
+        if snapshot is not None:
+            rollover_periods(
+                snapshot.periods,
+                previous_date,
+                current_date,
+            )
+            rollover_periods(
+                snapshot.call_periods,
+                previous_date,
+                current_date,
+            )
+        self.period_date = current_date
+
     def refresh_once(self) -> UsageSnapshot:
         try:
+            current_date = datetime.now(SHANGHAI).date()
             summary_path = self.report_dir / "summary.json"
             current_mtime = summary_path.stat().st_mtime if summary_path.exists() else 0.0
             if self.baseline is None or current_mtime != self.baseline.report_mtime:
                 self._reload()
+                self.period_date = current_date
+            else:
+                self._roll_periods_if_needed(current_date)
             assert self.baseline is not None
             assert self.codex is not None
             assert self.claude is not None
@@ -1832,12 +2002,12 @@ class FloatingRankRow:
     def __init__(self, parent: tk.Widget, rank: int, transparent: str):
         self.frame = tk.Frame(parent, bg=transparent)
         self.frame.pack(fill="x", pady=1)
-        self.frame.grid_columnconfigure(4, minsize=140)
-        self.frame.grid_columnconfigure(5, minsize=250, weight=1)
+        self.frame.grid_columnconfigure(4, minsize=DELTA_COLUMN_WIDTH)
+        self.frame.grid_columnconfigure(5, minsize=TOKEN_COLUMN_WIDTH, weight=1)
         self.rank_canvas = tk.Canvas(
             self.frame,
             bg=transparent,
-            width=34,
+            width=RANK_COLUMN_WIDTH,
             height=ROW_HEIGHT,
             highlightthickness=0,
             borderwidth=0,
@@ -1854,14 +2024,14 @@ class FloatingRankRow:
         self.platform_canvas = tk.Canvas(
             self.frame,
             bg="#4C8DFF",
-            width=92,
+            width=PLATFORM_COLUMN_WIDTH,
             height=44,
             highlightthickness=0,
             borderwidth=0,
         )
         self.platform_canvas.grid(row=0, column=1, sticky="w")
         self.platform_text_id = self.platform_canvas.create_text(
-            46,
+            PLATFORM_COLUMN_WIDTH // 2,
             22,
             text="平台",
             font=("Microsoft YaHei UI", -PLATFORM_BADGE_FONT_SIZE, "bold"),
@@ -1871,7 +2041,7 @@ class FloatingRankRow:
         self.model_canvas = tk.Canvas(
             self.frame,
             bg=transparent,
-            width=155,
+            width=MODEL_COLUMN_WIDTH,
             height=ROW_HEIGHT,
             highlightthickness=0,
             borderwidth=0,
@@ -1887,7 +2057,7 @@ class FloatingRankRow:
         )
         self.call_canvas = tk.Canvas(
             self.frame,
-            width=120,
+            width=CALL_COLUMN_WIDTH,
             height=ROW_HEIGHT,
             bg=transparent,
             highlightthickness=0,
@@ -1905,7 +2075,7 @@ class FloatingRankRow:
         self.delta_canvas = tk.Canvas(
             self.frame,
             bg=transparent,
-            width=140,
+            width=DELTA_COLUMN_WIDTH,
             height=ROW_HEIGHT,
             highlightthickness=0,
             borderwidth=0,
@@ -1916,7 +2086,7 @@ class FloatingRankRow:
             text="",
             font_name=CASCADIA_MONO_FONT,
             font_size=BODY_FONT_SIZE,
-            position=(138, ROW_MIDDLE),
+            position=(DELTA_COLUMN_WIDTH - 2, ROW_MIDDLE),
             anchor="rm",
         )
         self.delta_text.solid_color = "#20D878"
@@ -1924,7 +2094,7 @@ class FloatingRankRow:
         self.token_canvas = tk.Canvas(
             self.frame,
             bg=transparent,
-            width=250,
+            width=TOKEN_COLUMN_WIDTH,
             height=ROW_HEIGHT,
             highlightthickness=0,
             borderwidth=0,
@@ -1935,7 +2105,7 @@ class FloatingRankRow:
             text="0",
             font_name=CASCADIA_MONO_FONT,
             font_size=BODY_FONT_SIZE,
-            position=(248, ROW_MIDDLE),
+            position=(TOKEN_COLUMN_WIDTH - 2, ROW_MIDDLE),
             anchor="rm",
         )
         self.delta_hide_job = None
@@ -2050,7 +2220,7 @@ class FloatingRankRow:
             self.token_canvas,
             self.token_text,
             format_tokens(value),
-            (248, ROW_MIDDLE),
+            (TOKEN_COLUMN_WIDTH - 2, ROW_MIDDLE),
             "rm",
         )
         self.token_incoming_text = incoming_text
@@ -2338,7 +2508,7 @@ class LiveUsageApp:
         self.footer_canvas = tk.Canvas(
             self.footer_frame,
             bg=self.transparent,
-            width=760,
+            width=FOOTER_COLUMN_WIDTH,
             height=32,
             highlightthickness=0,
             borderwidth=0,
@@ -2349,7 +2519,7 @@ class LiveUsageApp:
             text="0.5s",
             font_name=YAHEI_FONT,
             font_size=20,
-            position=(758, 16),
+            position=(FOOTER_COLUMN_WIDTH - 2, 16),
             anchor="rm",
         )
         for widget in (
