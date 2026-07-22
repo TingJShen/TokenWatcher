@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -25,6 +26,7 @@ START_DATE = date(2026, 2, 1)
 REFRESH_SECONDS = 0.5
 STARTUP_HOT_SECONDS = 300.0
 REFERENCE_FILE_CHECK_SECONDS = 5.0
+FALLBACK_RESCAN_SECONDS = 30.0
 REPORT_CHECK_SECONDS = 10.0
 FINGERPRINT_COMPACT_THRESHOLD = 4096
 SHANGHAI = timezone(timedelta(hours=8))
@@ -39,6 +41,7 @@ PLATFORM_COLORS = {
     "Codex": "#4C8DFF",
     "Claude Code": "#F59E42",
     "Cline": "#26C6A2",
+    "DeepSeek API": "#536DFE",
 }
 REPORT_FOLDER_NAME = "codex_claude_usage_since_2026-02"
 CLINE_HISTORY = (
@@ -53,6 +56,19 @@ CLINE_HISTORY = (
     / "taskHistory.json"
 )
 CLINE_TASKS = CLINE_HISTORY.parent.parent / "tasks"
+SUB2API_ROOT = Path(
+    os.environ.get("TOKENWATCHER_SUB2API_ROOT", r"D:\software\sub2api")
+)
+SUB2API_CONFIG = Path(
+    os.environ.get("TOKENWATCHER_SUB2API_CONFIG", str(SUB2API_ROOT / "config.yaml"))
+)
+SUB2API_PSQL = Path(
+    os.environ.get(
+        "TOKENWATCHER_SUB2API_PSQL",
+        str(SUB2API_ROOT / "runtime" / "pgsql" / "bin" / "psql.exe"),
+    )
+)
+SUB2API_POLL_SECONDS = 5.0
 CODEX_USAGE_KEYS = (
     "input_tokens",
     "cached_input_tokens",
@@ -309,6 +325,7 @@ class DirectoryChangeWatcher:
         self.root = root
         self.available = False
         self._changes: queue.SimpleQueue[Path] = queue.SimpleQueue()
+        self._resync_required = threading.Event()
         self._closed = threading.Event()
         self._kernel32 = None
         self._handle = None
@@ -386,7 +403,9 @@ class DirectoryChangeWatcher:
         kernel32.ReadDirectoryChangesW.restype = wintypes.BOOL
         buffer = ctypes.create_string_buffer(64 * 1024)
         bytes_returned = wintypes.DWORD()
+        error_notify_enum_dir = 1022
         while not self._closed.is_set() and self._handle is not None:
+            ctypes.set_last_error(0)
             ok = kernel32.ReadDirectoryChangesW(
                 self._handle,
                 buffer,
@@ -398,11 +417,20 @@ class DirectoryChangeWatcher:
                 None,
             )
             if not ok:
+                if self._closed.is_set():
+                    break
+                self._resync_required.set()
+                if ctypes.get_last_error() == error_notify_enum_dir:
+                    continue
                 break
             length = int(bytes_returned.value)
             if not length:
-                self.available = False
-                break
+                # A synchronous ReadDirectoryChangesW call reports a buffer
+                # overflow with an empty result.  The directory handle remains
+                # usable, but one or more file names were lost.  Keep listening
+                # and ask consumers for one explicit reconciliation pass.
+                self._resync_required.set()
+                continue
             offset = 0
             while offset < length:
                 next_offset, _action, name_bytes = struct.unpack_from(
@@ -425,6 +453,12 @@ class DirectoryChangeWatcher:
                 changes.add(self._changes.get_nowait())
             except queue.Empty:
                 return changes
+
+    def consume_resync_required(self) -> bool:
+        if not self._resync_required.is_set():
+            return False
+        self._resync_required.clear()
+        return True
 
     def close(self) -> None:
         if self._closed.is_set():
@@ -942,6 +976,35 @@ class CodexTailTracker:
             state.next_check = 0.0
         return changed
 
+    def _resync_paths(self) -> set[Path]:
+        """Reconcile once after native notifications may have been lost."""
+        changed: set[Path] = set()
+        current_paths = set(self._paths())
+        for path in current_paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                self.errors += 1
+                continue
+            state = self.states.get(path)
+            if state is None:
+                state, _exact_cache_hit = self._state_from_cache(
+                    path,
+                    stat,
+                    startup_cold=False,
+                )
+                self.states[path] = state
+                changed.add(path)
+            elif state.last_size != stat.st_size or state.last_mtime != stat.st_mtime:
+                changed.add(path)
+            if path in changed:
+                state.watching = True
+                state.stop_after_initial = False
+                state.next_check = 0.0
+        for path in set(self.states) - current_paths:
+            del self.states[path]
+        return changed
+
     def _consume(self, data: bytes, state: CodexFileState, initial: bool) -> None:
         data = state.remainder + data
         lines = data.split(b"\n")
@@ -1059,11 +1122,14 @@ class CodexTailTracker:
     def poll(self) -> None:
         changed = self._discover_changes()
         now = time.monotonic()
-        if self.watcher.available:
+        resync_required = self.watcher.consume_resync_required()
+        if resync_required:
+            changed.update(self._resync_paths())
+        if self.watcher.available or resync_required:
             paths = changed
         elif now >= self.next_fallback_check:
-            paths = set(self.states)
-            self.next_fallback_check = now + REFERENCE_FILE_CHECK_SECONDS
+            paths = self._resync_paths()
+            self.next_fallback_check = now + FALLBACK_RESCAN_SECONDS
         else:
             paths = set()
         for path in paths:
@@ -1374,6 +1440,35 @@ class ClaudeTailTracker:
             state.next_check = 0.0
         return changed
 
+    def _resync_paths(self) -> set[Path]:
+        """Reconcile Claude logs once when directory notifications were lost."""
+        changed: set[Path] = set()
+        current_paths: set[Path] = set()
+        threshold = self.scan_since.timestamp() - 5
+        if self.root.exists():
+            for path in self.root.rglob("*.jsonl"):
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if stat.st_mtime < threshold and path not in self.states:
+                    continue
+                current_paths.add(path)
+                state = self.states.get(path)
+                if state is None:
+                    state = ClaudeFileState()
+                    self.states[path] = state
+                    changed.add(path)
+                elif state.last_size != stat.st_size or state.last_mtime != stat.st_mtime:
+                    changed.add(path)
+                if path in changed:
+                    state.watching = True
+                    state.stop_after_initial = False
+                    state.next_check = 0.0
+        for path in set(self.states) - current_paths:
+            del self.states[path]
+        return changed
+
     def _consume(self, data: bytes, state: ClaudeFileState) -> None:
         data = state.remainder + data
         lines = data.split(b"\n")
@@ -1467,11 +1562,14 @@ class ClaudeTailTracker:
     def poll(self) -> None:
         changed = self._discover_changes()
         now = time.monotonic()
-        if self.watcher.available:
+        resync_required = self.watcher.consume_resync_required()
+        if resync_required:
+            changed.update(self._resync_paths())
+        if self.watcher.available or resync_required:
             paths = changed
         elif now >= self.next_fallback_check:
-            paths = set(self.states)
-            self.next_fallback_check = now + REFERENCE_FILE_CHECK_SECONDS
+            paths = self._resync_paths()
+            self.next_fallback_check = now + FALLBACK_RESCAN_SECONDS
         else:
             paths = set()
         for path in paths:
@@ -1683,10 +1781,16 @@ class ClinePoller:
 
     def poll(self) -> None:
         changes = self.request_counter.watcher.drain()
-        history_changed = CLINE_HISTORY in changes
+        resync_required = self.request_counter.watcher.consume_resync_required()
+        history_changed = CLINE_HISTORY in changes or resync_required
         current_tasks = self.task_cache.read(
             force=history_changed
         )
+        if resync_required:
+            changes.update(
+                CLINE_TASKS / task_id / "ui_messages.json"
+                for task_id in current_tasks
+            )
         self.request_counter.poll_changes(current_tasks, changes)
         current_by_model = Counter()
         delta_periods = empty_periods()
@@ -1747,6 +1851,162 @@ class ClinePoller:
 
     def close(self) -> None:
         self.request_counter.close()
+
+
+def load_sub2api_database_config(path: Path) -> dict[str, str]:
+    """Read only the simple database mapping from sub2api's local YAML file."""
+    values: dict[str, str] = {}
+    inside_database = False
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        if not inside_database:
+            if re.fullmatch(r"database\s*:\s*", raw_line):
+                inside_database = True
+            continue
+        if raw_line and not raw_line[0].isspace():
+            break
+        match = re.match(
+            r"^\s+(host|port|user|password|dbname)\s*:\s*(.*?)\s*$",
+            raw_line,
+        )
+        if not match:
+            continue
+        value = match.group(2)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[match.group(1)] = value
+    missing = [name for name in ("host", "port", "user", "dbname") if not values.get(name)]
+    if missing:
+        raise ValueError(f"sub2api database config missing: {', '.join(missing)}")
+    return values
+
+
+class DeepSeekApiPoller:
+    """Read DeepSeek API usage recorded by the local sub2api PostgreSQL service."""
+
+    QUERY = """
+SELECT
+    model,
+    to_char(created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD'),
+    COALESCE(SUM(
+        input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
+    ), 0),
+    COUNT(*),
+    to_char(
+        MAX(created_at) AT TIME ZONE 'Asia/Shanghai',
+        'YYYY-MM-DD"T"HH24:MI:SS.US'
+    ) || '+08:00'
+FROM usage_logs
+WHERE LOWER(model) LIKE 'deepseek%'
+  AND created_at >= TIMESTAMPTZ '2026-02-01 00:00:00+08'
+GROUP BY model, to_char(created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD')
+ORDER BY MAX(created_at);
+""".strip()
+
+    def __init__(
+        self,
+        config_path: Path | None = None,
+        psql_path: Path | None = None,
+        runner=None,
+    ):
+        self.config_path = config_path or SUB2API_CONFIG
+        self.psql_path = psql_path or SUB2API_PSQL
+        self.runner = runner or subprocess.run
+        self.periods = empty_periods()
+        self.call_periods = empty_periods()
+        self.status = "DeepSeek API 正在载入"
+        self.last_event: datetime | None = None
+        self.next_check = 0.0
+        self.poll(force=True)
+
+    def _command(self, config: dict[str, str]) -> list[str]:
+        return [
+            str(self.psql_path),
+            "-X",
+            "-w",
+            "-h",
+            config["host"],
+            "-p",
+            config["port"],
+            "-U",
+            config["user"],
+            "-d",
+            config["dbname"],
+            "-At",
+            "-F",
+            "\t",
+            "-c",
+            self.QUERY,
+        ]
+
+    def _replace_usage(self, output: str) -> None:
+        periods = empty_periods()
+        call_periods = empty_periods()
+        latest: datetime | None = None
+        total_calls = 0
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            fields = line.split("\t", 4)
+            if len(fields) != 5:
+                raise ValueError("unexpected sub2api query output")
+            model, day_text, token_text, call_text, latest_text = fields
+            if not model.lower().startswith("deepseek"):
+                continue
+            event_date = date.fromisoformat(day_text)
+            tokens = int(token_text)
+            calls = int(call_text)
+            key = ("DeepSeek API", model)
+            add_period_usage(periods, key, tokens, event_date)
+            add_period_usage(call_periods, key, calls, event_date)
+            total_calls += calls
+            row_latest = parse_time(latest_text)
+            if latest is None or row_latest > latest:
+                latest = row_latest
+        self.periods = periods
+        self.call_periods = call_periods
+        self.last_event = latest
+        latest_label = (
+            latest.astimezone(SHANGHAI).strftime("%m-%d %H:%M:%S")
+            if latest
+            else "无记录"
+        )
+        self.status = f"DeepSeek API：{total_calls} 次，最新 {latest_label}"
+
+    def poll(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now < self.next_check:
+            return
+        self.next_check = now + SUB2API_POLL_SECONDS
+        try:
+            if not self.config_path.is_file() or not self.psql_path.is_file():
+                self.status = "DeepSeek API：未检测到 sub2api"
+                return
+            config = load_sub2api_database_config(self.config_path)
+            environment = dict(os.environ)
+            environment["PGPASSWORD"] = config.get("password", "")
+            result = self.runner(
+                self._command(config),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=3.0,
+                check=False,
+                env=environment,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode != 0:
+                self.status = f"DeepSeek API：sub2api 查询失败 ({result.returncode})"
+                return
+            self._replace_usage(result.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            detail = re.sub(r"\s+", " ", str(exc)).strip()[:120]
+            self.status = f"DeepSeek API：{type(exc).__name__} ({detail})"
+
+    def roll_periods(self, previous_date: date, current_date: date) -> None:
+        rollover_periods(self.periods, previous_date, current_date)
+        rollover_periods(self.call_periods, previous_date, current_date)
+        self.next_check = 0.0
 
 
 @dataclass(frozen=True)
@@ -1851,6 +2111,7 @@ class UsageEngine:
         self.claude_usage = ClaudeUsageCache()
         self.claude_boundary: datetime | None = None
         self.cline: ClinePoller | None = None
+        self.deepseek_api: DeepSeekApiPoller | None = None
         self.period_date = datetime.now(SHANGHAI).date()
         self.next_report_check = 0.0
         self._load_snapshot_cache()
@@ -1952,6 +2213,7 @@ class UsageEngine:
         )
         self.claude_boundary = claude_boundary
         self.cline = ClinePoller(self.baseline)
+        self.deepseek_api = DeepSeekApiPoller()
 
     def _roll_periods_if_needed(self, current_date: date) -> None:
         if current_date <= self.period_date:
@@ -1984,6 +2246,8 @@ class UsageEngine:
             tracker.cache_dirty = True
         if self.cline is not None:
             self.cline.roll_periods(previous_date, current_date)
+        if self.deepseek_api is not None:
+            self.deepseek_api.roll_periods(previous_date, current_date)
         snapshot = self.get_snapshot()
         if snapshot is not None:
             rollover_periods(
@@ -2020,8 +2284,10 @@ class UsageEngine:
             assert self.codex is not None
             assert self.claude is not None
             assert self.cline is not None
+            assert self.deepseek_api is not None
             self.codex.poll()
             self.cline.poll()
+            self.deepseek_api.poll()
             claude_periods, claude_status, claude_boundary = self.claude_usage.read()
             if self.claude is None or self.claude_boundary != claude_boundary:
                 if self.claude is not None:
@@ -2043,6 +2309,9 @@ class UsageEngine:
                 for key in [key for key in values if key[0] == "Cline"]:
                     del values[key]
                 values.update(self.cline.periods[period])
+                for key in [key for key in values if key[0] == "DeepSeek API"]:
+                    del values[key]
+                values.update(self.deepseek_api.periods[period])
                 combined_periods[period] = dict(values)
                 calls = Counter(self.baseline.call_periods[period])
                 calls.update(self.codex.call_periods[period])
@@ -2050,6 +2319,9 @@ class UsageEngine:
                 for key in [key for key in calls if key[0] == "Cline"]:
                     del calls[key]
                 calls.update(self.cline.call_periods[period])
+                for key in [key for key in calls if key[0] == "DeepSeek API"]:
+                    del calls[key]
+                calls.update(self.deepseek_api.call_periods[period])
                 combined_call_periods[period] = dict(calls)
             last_event = (
                 self.codex.last_event.astimezone(SHANGHAI).strftime("%H:%M:%S")
@@ -2070,6 +2342,7 @@ class UsageEngine:
                     f"Codex 增量事件：{self.codex.fingerprint_count()}，最新 {last_event}",
                     f"{claude_status}，尾读 {len(self.claude.seen)} 条，最新 {claude_last_event}",
                     self.cline.status,
+                    self.deepseek_api.status,
                 ),
             )
         except Exception as exc:

@@ -1,6 +1,6 @@
 # TokenWatcher
 
-TokenWatcher is a lightweight Windows desktop overlay that displays the three most-used AI models and their exact token counts. It reads local Codex, Claude Code, and Cline usage data and refreshes the overlay every 0.5 seconds while using native Windows filesystem notifications for local log changes.
+TokenWatcher is a lightweight Windows desktop overlay that displays the three most-used AI models and their exact token counts. It reads local Codex, Claude Code, Cline, and DeepSeek API usage data and refreshes the overlay every 0.5 seconds while using native Windows filesystem notifications for local log changes.
 
 ## Features
 
@@ -8,6 +8,7 @@ TokenWatcher is a lightweight Windows desktop overlay that displays the three mo
 - Exact token totals without K/M/B abbreviation
 - Per-model request counts
 - Event-driven log discovery, incremental tailing, and cached summary/task files
+- Automatic one-pass reconciliation after Windows notification-buffer loss; a 30-second discovery fallback is used only while native notifications are unavailable
 - Codex cumulative-snapshot deduplication across continued or forked tasks
 - Persistent Codex fingerprint/offset cache for fast restarts
 - Immediate startup display from the last verified aggregate snapshot; live sources reconcile it in the background
@@ -26,8 +27,9 @@ TokenWatcher is a lightweight Windows desktop overlay that displays the three mo
 - Codex: `~/.codex/sessions` and `~/.codex/archived_sessions`
 - Claude Code: `~/.claude/stats-cache.json` and `~/.claude/projects`
 - Cline: VS Code's `saoudrizwan.claude-dev` global storage
+- DeepSeek API: DeepSeek model rows in the local sub2api PostgreSQL `usage_logs` table
 
-TokenWatcher only reads these files locally. It does not send usage records anywhere.
+TokenWatcher only reads these local sources. It does not send usage records anywhere. By default, sub2api is discovered at `D:\software\sub2api`; custom installations can set `TOKENWATCHER_SUB2API_ROOT`, `TOKENWATCHER_SUB2API_CONFIG`, or `TOKENWATCHER_SUB2API_PSQL`.
 
 ## Run from source
 

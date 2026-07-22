@@ -25,6 +25,7 @@ class FakeWatcher:
     def __init__(self) -> None:
         self.available = True
         self.changes: set[Path] = set()
+        self.resync_required = False
 
     def emit(self, path: Path) -> None:
         self.changes.add(path)
@@ -34,11 +35,56 @@ class FakeWatcher:
         self.changes.clear()
         return changes
 
+    def lose_changes(self) -> None:
+        self.changes.clear()
+        self.resync_required = True
+
+    def consume_resync_required(self) -> bool:
+        required = self.resync_required
+        self.resync_required = False
+        return required
+
     def close(self) -> None:
         return
 
 
 class TokenWatcherTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows notification API test")
+    def test_directory_watcher_keeps_listening_after_overflow_error(self) -> None:
+        import ctypes
+
+        watcher = object.__new__(token_watcher.DirectoryChangeWatcher)
+        watcher._closed = token_watcher.threading.Event()
+        watcher._resync_required = token_watcher.threading.Event()
+        watcher._handle = object()
+        watcher.available = True
+
+        class FakeReadDirectoryChanges:
+            argtypes = None
+            restype = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(self, *_args) -> int:
+                self.calls += 1
+                if self.calls == 1:
+                    ctypes.set_last_error(1022)
+                    return 0
+                watcher._closed.set()
+                ctypes.set_last_error(995)
+                return 0
+
+        read_changes = FakeReadDirectoryChanges()
+        kernel32 = type("FakeKernel32", (), {})()
+        kernel32.ReadDirectoryChangesW = read_changes
+        watcher._kernel32 = kernel32
+
+        watcher._run_windows()
+
+        self.assertEqual(read_changes.calls, 2)
+        self.assertTrue(watcher.consume_resync_required())
+
     @staticmethod
     def _codex_lines(
         session_id: str,
@@ -225,6 +271,61 @@ class TokenWatcherTests(unittest.TestCase):
             token_watcher.active_periods(date(2026, 7, 12), now),
             ("cumulative", "month"),
         )
+
+    def test_sub2api_database_config_is_read_without_exposing_password(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "config.yaml"
+            config_path.write_text(
+                """server:\n  port: 8080\ndatabase:\n  host: 127.0.0.1\n  port: 5432\n  user: postgres\n  password: 'secret#value'\n  dbname: sub2api\nredis:\n  host: 127.0.0.1\n""",
+                encoding="utf-8",
+            )
+            config = token_watcher.load_sub2api_database_config(config_path)
+            self.assertEqual(config["password"], "secret#value")
+            self.assertEqual(config["dbname"], "sub2api")
+
+    def test_deepseek_api_poller_reads_tokens_and_calls_from_sub2api(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config_path = root / "config.yaml"
+            psql_path = root / "psql.exe"
+            config_path.write_text(
+                """database:\n  host: 127.0.0.1\n  port: 5432\n  user: postgres\n  password: secret-value\n  dbname: sub2api\n""",
+                encoding="utf-8",
+            )
+            psql_path.write_bytes(b"")
+            now = datetime.now(token_watcher.SHANGHAI)
+            yesterday = now.date() - timedelta(days=1)
+            output = "\n".join(
+                (
+                    f"deepseek-v4-flash\t{now.date()}\t146\t3\t{now.isoformat()}",
+                    f"deepseek-v4-pro\t{yesterday}\t68\t1\t{(now - timedelta(days=1)).isoformat()}",
+                )
+            )
+            captured = {}
+
+            def fake_runner(command, **kwargs):
+                captured["command"] = command
+                captured["env"] = kwargs["env"]
+                return type(
+                    "Result",
+                    (),
+                    {"returncode": 0, "stdout": output, "stderr": ""},
+                )()
+
+            poller = token_watcher.DeepSeekApiPoller(
+                config_path=config_path,
+                psql_path=psql_path,
+                runner=fake_runner,
+            )
+            flash_key = ("DeepSeek API", "deepseek-v4-flash")
+            pro_key = ("DeepSeek API", "deepseek-v4-pro")
+            self.assertEqual(poller.periods["today"][flash_key], 146)
+            self.assertEqual(poller.periods["cumulative"][pro_key], 68)
+            self.assertEqual(poller.call_periods["today"][flash_key], 3)
+            self.assertIn("4 次", poller.status)
+            self.assertNotIn("secret-value", captured["command"])
+            self.assertEqual(captured["env"]["PGPASSWORD"], "secret-value")
+            self.assertIn("cache_read_tokens", poller.QUERY)
 
     def test_midnight_rollover_clears_calendar_periods_only(self) -> None:
         key = ("Codex", "gpt-test")
@@ -537,6 +638,41 @@ class TokenWatcherTests(unittest.TestCase):
             self.assertEqual(
                 tracker.periods["cumulative"][("Codex", "gpt-test")], 30
             )
+
+    def test_codex_notification_loss_resyncs_cold_and_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            session_dir = home / ".codex" / "sessions" / "2026" / "07" / "22"
+            session_dir.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            cold = session_dir / "cold.jsonl"
+            cold.write_text(self._codex_lines("cold", 1, now), encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(cold, (old, old))
+            watcher = FakeWatcher()
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                tracker = token_watcher.CodexTailTracker(
+                    now - timedelta(days=1), watcher=watcher
+                )
+            self.assertFalse(tracker.states[cold].watching)
+
+            with cold.open("a", encoding="utf-8") as handle:
+                handle.write(self._codex_lines("cold", 20, now + timedelta(seconds=1)))
+            new_file = session_dir / "new.jsonl"
+            new_file.write_text(
+                self._codex_lines("new", 30, now + timedelta(seconds=2)),
+                encoding="utf-8",
+            )
+            watcher.lose_changes()
+            tracker.poll()
+
+            self.assertTrue(tracker.states[cold].watching)
+            self.assertIn(new_file, tracker.states)
+            self.assertEqual(
+                tracker.periods["cumulative"][("Codex", "gpt-test")], 51
+            )
+            with patch.object(token_watcher.Path, "rglob", side_effect=AssertionError):
+                tracker.poll()
 
     def test_codex_repeated_cumulative_snapshots_are_counted_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -910,6 +1046,42 @@ class TokenWatcherTests(unittest.TestCase):
                 tracker.periods["cumulative"][("Claude Code", "claude-test")],
                 21,
             )
+
+    def test_claude_notification_loss_resyncs_cold_and_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            project_dir = home / ".claude" / "projects" / "project"
+            project_dir.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            cold = project_dir / "cold.jsonl"
+            cold.write_text(self._claude_line("cold", 1, now), encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(cold, (old, old))
+            watcher = FakeWatcher()
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                tracker = token_watcher.ClaudeTailTracker(
+                    now - timedelta(days=1), watcher=watcher
+                )
+            self.assertFalse(tracker.states[cold].watching)
+
+            with cold.open("a", encoding="utf-8") as handle:
+                handle.write(self._claude_line("cold-next", 20, now + timedelta(seconds=1)))
+            new_file = project_dir / "new.jsonl"
+            new_file.write_text(
+                self._claude_line("new", 30, now + timedelta(seconds=2)),
+                encoding="utf-8",
+            )
+            watcher.lose_changes()
+            tracker.poll()
+
+            self.assertTrue(tracker.states[cold].watching)
+            self.assertIn(new_file, tracker.states)
+            self.assertEqual(
+                tracker.periods["cumulative"][("Claude Code", "claude-test")],
+                51,
+            )
+            with patch.object(token_watcher.Path, "rglob", side_effect=AssertionError):
+                tracker.poll()
 
     def test_claude_cache_skips_unchanged_jsonl_files_on_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
